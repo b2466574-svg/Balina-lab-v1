@@ -18,9 +18,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina LABORATUVAR v2 (TAM FİLTRESİZ + TP4 + Sıra No)"
+VERSION_NAME = "Balina LABORATUVAR v2.1 (Sahte Stop Onarımı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "LAB-v2")
+BOT_BUILD = os.getenv("BOT_BUILD", "LAB-v2.1")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -7310,6 +7310,77 @@ if LAB_FILTRESIZ:
                    "Sadece ölçüm yapılıyor. Canlı işlem için kullanma.")
 
 
+# ============================================================================ #
+#  LAB v2.1 — SAHTE STOP ONARIMI  (Hasan tespiti, 09 Ağu 2026)
+#
+#  BULGU: "Stop olmadan stop mesajı geliyor, MEXC'e de OKX'e de bakıyorum,
+#  stop olmasına %1.5 var." Doğru tespit — gerçek bir hata.
+#
+#  KÖK SEBEP: takip döngüsü OLUŞMAKTA OLAN 1H mumunun high/low'una bakıyordu.
+#  Pozisyon saat 10:47'de açıldıysa, 10:00 mumunun dibi 10:12'de yapılmış
+#  olabilir — yani GİRİŞTEN 35 DAKİKA ÖNCE. Kod bunu "stopa değdi" sayıyordu.
+#  Fiyat o seviyeye hiç gitmemiş olsa bile.
+#
+#  Bu kusur V10/V11 hattından beri kodda duruyordu; filtreler açıkken sinyal
+#  az olduğu için görünmüyordu. Filtresiz modda her sinyal mum ortasında
+#  açıldığı için sistematik hale geldi. Aynı kusur TP tarafında da vardı
+#  (giriş öncesi tepe = sahte TP1).
+#
+#  ÇÖZÜM: takip artık 1 DAKİKALIK mumlarla yapılıyor ve SADECE pozisyon
+#  açıldıktan SONRA başlayan mumlar sayılıyor. Girişin içinde bulunduğu
+#  kısmi mum tamamen atılır — en fazla 60 saniyelik fitil kaybederiz;
+#  buna karşılık uydurma stop/TP tamamen biter. Kaybı olan yönde hata
+#  yapmak, olmayan stopu yazmaktan çok daha iyidir.
+# ============================================================================ #
+LAB_TAKIP_TF    = os.getenv("LAB_TAKIP_TF", "1m").strip()
+LAB_TAKIP_LIMIT = int(float(os.getenv("LAB_TAKIP_LIMIT", "60")))
+_TF_DAKIKA = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+              "1H": 60, "2H": 120, "4H": 240, "1D": 1440}
+
+
+def lab_takip_bar_sayisi(pos: Dict[str, Any]) -> int:
+    """Son kontrolden bu yana geçen süreyi kapsayacak kadar mum iste.
+    Normalde 60 bar yeter; uzun bir kesinti/deploy sonrası pencere otomatik
+    genişler ki aradaki hareket gözden kaçmasın."""
+    bar_dk = _TF_DAKIKA.get(LAB_TAKIP_TF, 1)
+    basla = safe_float(pos.get("son_kontrol_ts")) or safe_float(pos.get("open_ts"))
+    if basla <= 0:
+        return LAB_TAKIP_LIMIT
+    gerek = ((time.time() - basla) / 60.0) / max(1, bar_dk) + 5
+    return int(max(LAB_TAKIP_LIMIT, min(300, gerek)))
+
+
+def lab_takip_penceresi(k: List[List[Any]], pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Pozisyon AÇILDIKTAN SONRAKİ mumlardan fiyat/hi/lo çıkarır.
+
+    Girişten önce başlayan mumlar tamamen dışarıda bırakılır — sahte stop ve
+    sahte TP'nin kaynağı tam olarak onlardı. Henüz giriş sonrası kapalı mum
+    yoksa fitil kullanılmaz, sadece anlık fiyata bakılır."""
+    if not k:
+        return None
+    acilis_ms = safe_float(pos.get("open_ts")) * 1000.0
+    fiyat = safe_float(k[-1][4])
+    if fiyat <= 0:
+        return None
+    sonra = [r for r in k if safe_float(r[0]) >= acilis_ms]
+    once  = [r for r in k if safe_float(r[0]) <  acilis_ms]
+    if sonra:
+        hi = max(safe_float(r[2]) for r in sonra)
+        lo = min(safe_float(r[3]) for r in sonra)
+    else:
+        # Pozisyon bu dakika içinde açıldı: fitil yok, sadece anlık fiyat.
+        hi = lo = fiyat
+    # TEŞHİS: giriş ÖNCESİ mumlar stopu tetikler miydi? (eski hatanın sayacı)
+    onceki_stop = False
+    if once:
+        st = safe_float(pos.get("orig_stop"))
+        p_hi = max(safe_float(r[2]) for r in once)
+        p_lo = min(safe_float(r[3]) for r in once)
+        onceki_stop = (p_lo <= st) if pos.get("side") == "LONG" else (p_hi >= st)
+    return {"fiyat": fiyat, "hi": max(hi, fiyat), "lo": min(lo, fiyat),
+            "bar": len(sonra), "onceki_stop": onceki_stop}
+
+
 def lab_sira_al() -> int:
     """Her sinyale kalıcı, artan bir SIRA numarası verir.
     Sinyal mesajında da, TP/STOP mesajında da aynı numara görünür — böylece
@@ -9381,15 +9452,24 @@ async def v10_paper_loop() -> None:
             for i in range(0, len(acik), B):
                 grup = acik[i:i+B]
                 kl = await asyncio.gather(
-                    *[get_klines(p["symbol"], MA_KLINE_INTERVAL, 3) for p in grup],
+                    *[get_klines(p["symbol"], LAB_TAKIP_TF, lab_takip_bar_sayisi(p))
+                      for p in grup],
                     return_exceptions=True)
                 for pos, k in zip(grup, kl):
                     if isinstance(k, Exception) or not k:
                         still.append(pos); continue
+                    # LAB v2.1: SADECE giriş sonrası mumlar. Giriş öncesi
+                    # fitiller "stop/TP oldu" sanılıyordu — sahte stopun kökü.
+                    pen = lab_takip_penceresi(k, pos)
+                    if not pen:
+                        still.append(pos); continue
+                    pos["son_kontrol_ts"] = time.time()
                     onceki = [bool(pos.get(f"hit{n}")) for n in (1, 2, 3, 4)]
-                    last = k[-1]
-                    R, oc = v10_check_paper(pos, closes(k)[-1],
-                                            safe_float(last[2]), safe_float(last[3]))
+                    R, oc = v10_check_paper(pos, pen["fiyat"], pen["hi"], pen["lo"])
+                    if pen["onceki_stop"] and oc != "STOP":
+                        # Eski kod burada SAHTE STOP yazacaktı. Sayacı /v10'da.
+                        stats["lab_sahte_stop_onlendi"] = int(
+                            safe_float(stats.get("lab_sahte_stop_onlendi"))) + 1
                     if not oc:
                         for n in (1, 2, 3):
                             if pos.get(f"hit{n}") and not onceki[n-1]:
@@ -9809,6 +9889,8 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"TP3 %{V11_TP3_PCT:g} | TP4 %{V11_TP4_PCT:g} (SON) | "
         f"ağırlık {'/'.join(f'{x:g}' for x in LAB_TP_AGIRLIK)}",
         f"TP1'de BE kapanış: {'AÇIK' if LAB_BE_KAPAT else 'KAPALI (pozisyon devam eder)'}",
+        f"🔬 Takip: {LAB_TAKIP_TF} mum, SADECE giriş sonrası fitiller | "
+        f"önlenen sahte stop: {int(safe_float(stats.get('lab_sahte_stop_onlendi')))}",
         f"Motor: {'AÇIK' if V10_ENGINE_ENABLED else 'KAPALI'} | Min skor: {int(V10_MIN_QUALITY)}",
         f"Analiz: {stats.get('v10_analyzed',0)} | Aday: {stats.get('v10_candidates',0)} | Sinyal: {stats.get('v10_signals',0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
