@@ -18,9 +18,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina LABORATUVAR v1 (Filtresiz Veri Toplama)"
+VERSION_NAME = "Balina LABORATUVAR v2 (TAM FİLTRESİZ + TP4 + Sıra No)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "LAB-v1")
+BOT_BUILD = os.getenv("BOT_BUILD", "LAB-v2")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -6271,8 +6271,23 @@ def lab_db():
             g_volsok INT, g_drift INT, g_tekrar INT, g_hepsi INT,
             -- SONUÇ
             sonuc TEXT, r REAL, hit1 INT, hit2 INT, hit3 INT, sure_dk REAL)""")
-        for ix in ("sembol","sonuc","giris_tipi","g_hepsi"):
-            con.execute(f"CREATE INDEX IF NOT EXISTS ix_lab_{ix} ON lab({ix})")
+        # --- LAB v2 GÖÇÜ: eski lab.db dosyasına yeni sütunları ekle ---------
+        # Railway'de zaten veri toplamış bir dosya varsa SİLİNMEZ; sadece
+        # eksik sütunlar eklenir. ALTER TABLE ADD COLUMN veriyi bozmaz.
+        _yeni = {"sira":"INT", "tp4":"REAL", "hit4":"INT",
+                 "mfe_pct":"REAL", "mae_pct":"REAL",
+                 "g_4h":"INT", "g_fomo":"INT"}
+        try:
+            _mevcut = {r[1] for r in con.execute("PRAGMA table_info(lab)")}
+            for _c, _t in _yeni.items():
+                if _c not in _mevcut:
+                    con.execute(f"ALTER TABLE lab ADD COLUMN {_c} {_t}")
+                    logger.info("LAB göç: %s sütunu eklendi", _c)
+        except Exception as e:
+            logger.warning("LAB göç hatası: %s", e)
+        for ix in ("sembol","sonuc","giris_tipi","g_hepsi","sira"):
+            try: con.execute(f"CREATE INDEX IF NOT EXISTS ix_lab_{ix} ON lab({ix})")
+            except Exception: pass
         con.commit()
         _lab_db = con
         logger.info("LAB veritabanı açıldı: %s", yol)
@@ -6287,7 +6302,7 @@ def lab_yeni() -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     for g in ("yapi","range","choch","sweep","retest","cvd","balina","spoof",
               "hacim","spread","btc","rsi","skor","arastirma","1d","volsok",
-              "drift","tekrar"):
+              "drift","tekrar","4h","fomo"):
         d["g_" + g] = 1          # varsayılan: geçerdi
     return d
 
@@ -6305,21 +6320,23 @@ def lab_kaydet(sig: Dict[str, Any], lab: Dict[str, Any], giris_tipi: str) -> Opt
         ytip = ("SÜPÜRME DÖNÜŞÜ" if "Süpürme" in yapi else
                 "CHoCH" if "CHoCH" in yapi else "BOS" if "BOS" in yapi else "RASTGELE")
         simdi = tr_now()
-        hepsi = 1 if all(int(safe_float(lab.get("g_" + g), 1)) == 1 for g in
-                         ("yapi","range","choch","sweep","retest","cvd","balina","spoof",
-                          "hacim","spread","btc","rsi","skor","arastirma","1d",
-                          "volsok","drift","tekrar")) else 0
+        _KAPILAR = ("yapi","range","choch","sweep","retest","cvd","balina","spoof",
+                    "hacim","spread","btc","rsi","skor","arastirma","1d",
+                    "volsok","drift","tekrar","4h","fomo")
+        hepsi = 1 if all(int(safe_float(lab.get("g_" + g), 1)) == 1
+                         for g in _KAPILAR) else 0
         cur = con.execute(
             "INSERT INTO lab(acilis_ts,sembol,yon,giris_tipi,setup,yapi_tipi,giris,stop,"
-            "tp1,tp2,tp3,skor,arastirma,rsi,trend_15m,trend_1h,trend_4h,rejim_1d,"
+            "tp1,tp2,tp3,tp4,sira,skor,arastirma,rsi,trend_15m,trend_1h,trend_4h,rejim_1d,"
             "btc_1h,btc_4h,sweep,fib_derinlik,hacim_orani,spread,aralik_konum,oi,funding,"
             "cvd,cvd_n,balina,balina_n,spoof,grafik_puan,haber,saat,gun,"
             "g_yapi,g_range,g_choch,g_sweep,g_retest,g_cvd,g_balina,g_spoof,g_hacim,"
             "g_spread,g_btc,g_rsi,g_skor,g_arastirma,g_1d,g_volsok,g_drift,g_tekrar,"
-            "g_hepsi,sonuc) VALUES(" + ",".join(["?"]*56) + ")",
+            "g_4h,g_fomo,g_hepsi,sonuc) VALUES(" + ",".join(["?"]*60) + ")",
             (time.time(), sig.get("symbol"), sig.get("direction"), giris_tipi,
              sig.get("setup"), ytip, safe_float(sig.get("entry")), safe_float(sig.get("stop")),
              safe_float(sig.get("tp1")), safe_float(sig.get("tp2")), safe_float(sig.get("tp3")),
+             safe_float(sig.get("tp4")), int(safe_float(sig.get("sira"))),
              safe_float(sig.get("score")), safe_float(rs.get("score")), safe_float(sig.get("rsi")),
              sig.get("trend_struct"), sig.get("trend_1h"), sig.get("trend_4h"),
              sig.get("gunluk_rejim"), sig.get("btc_1h"), sig.get("btc_4h"),
@@ -6331,9 +6348,7 @@ def lab_kaydet(sig: Dict[str, Any], lab: Dict[str, Any], giris_tipi: str) -> Opt
              int(safe_float(w.get("n"))), str(sp.get("egilim") or "-"),
              safe_float(gr.get("puan")), safe_float((rs.get("news") or {}).get("score")),
              simdi.hour, simdi.weekday(),
-             *[int(safe_float(lab.get("g_" + g), 1)) for g in
-               ("yapi","range","choch","sweep","retest","cvd","balina","spoof","hacim",
-                "spread","btc","rsi","skor","arastirma","1d","volsok","drift","tekrar")],
+             *[int(safe_float(lab.get("g_" + g), 1)) for g in _KAPILAR],
              hepsi, "ACIK"))
         con.commit()
         stats["lab_acilis"] = int(stats.get("lab_acilis", 0)) + 1
@@ -6352,10 +6367,12 @@ def lab_kapat(pos: Dict[str, Any], R: float, outcome: str) -> None:
         return
     try:
         sure = (time.time() - safe_float(pos.get("open_ts"))) / 60.0
-        con.execute("UPDATE lab SET kapanis_ts=?,sonuc=?,r=?,hit1=?,hit2=?,hit3=?,sure_dk=? "
-                    "WHERE id=?",
+        con.execute("UPDATE lab SET kapanis_ts=?,sonuc=?,r=?,hit1=?,hit2=?,hit3=?,hit4=?,"
+                    "mfe_pct=?,mae_pct=?,sure_dk=? WHERE id=?",
                     (time.time(), outcome, round(R, 3), int(bool(pos.get("hit1"))),
                      int(bool(pos.get("hit2"))), int(bool(pos.get("hit3"))),
+                     int(bool(pos.get("hit4"))),
+                     safe_float(pos.get("mfe_pct")), safe_float(pos.get("mae_pct")),
                      round(sure, 1), rid))
         con.commit()
         n = int(safe_float(stats.get("lab_kapanis"))) + 1
@@ -7196,6 +7213,125 @@ v10_last_alert: Dict[str, float] = {}
 v10_sent_candle: Dict[str, str] = {}
 
 
+# ============================================================================ #
+#  LAB v2 — TAM FİLTRESİZ MOD  (Hasan mandatı, 09 Ağu 2026)
+#
+#  MANDAT (birebir): "Hiçbir filtrenin skoru olmayacak hepsi 0 olacak, hiçbir
+#  filtre skoru sinyal atmasını engellemeyecek. Filtre skorunu silmeyeceksin,
+#  sadece sinyal atmasına engel olmayacak; skor 30'da da gelecek 97'de de
+#  gelecek, ama aynı filtreler ve eşikleri kodda görünecek."
+#
+#  BU YÜZDEN İKİ ŞEYİ AYIRIYORUZ:
+#    ÖLÇÜM   → hiç dokunulmadı. Her kapı eskisi gibi hesaplanır, eşikler
+#              aşağıdaki _ESIK_ORIJINAL'de aynen durur, kesip kesmeyeceği
+#              lab["g_*"] bayrağına yazılır ve SQLite'a düşer.
+#    ENGELLEME → tamamen sıfır. Hiçbir kapı return/continue etmez.
+#
+#  Yani "eşik 0" demek: ENGELLEME eşiği 0. Skor hâlâ hesaplanıyor, mesajda
+#  görünüyor, deftere yazılıyor — sadece kimseyi kapıda durdurmuyor.
+#  20 gün / 2.000 kapanış sonunda /kazanan hangi kapının GERÇEKTEN para
+#  kazandırdığını gösterir. Ayarı bot değil, HASAN yapar.
+#
+#  DÜRÜST UYARI (mühendislik notu, mandatın dışında değil — içinde):
+#  Bu mod PARA İÇİN DEĞİL, VERİ İÇİNDİR. Filtresiz sinyal akışı günde yüzlerce
+#  olur ve bunların çoğu bilerek kötü kurulumdur; amaç zaten onları görmek.
+#  Bu sinyallerle canlı işlem açılmaz — paper defterinde ölçülür.
+# ============================================================================ #
+LAB_FILTRESIZ    = os.getenv("LAB_FILTRESIZ", "true").lower() == "true"
+LAB_TELEGRAM     = os.getenv("LAB_TELEGRAM", "true").lower() == "true"   # sinyalin kendisi de gelsin
+LAB_GRAFIK       = os.getenv("LAB_GRAFIK", "false").lower() == "true"    # görsel kart (yavaş + rate-limit)
+LAB_TEK_POZISYON = os.getenv("LAB_TEK_POZISYON", "true").lower() == "true"  # aynı coinde tek açık poz.
+
+# --- TP4 ve "TP1'den sonra DEVAM" mandatı ---------------------------------- #
+# Eski davranış: TP1 gelince stop girişe çekiliyordu ve fiyat girişe dönünce
+# pozisyon BE olarak KAPANIYORDU. Bu yüzden "sinyal nereye kadar giderdi"
+# sorusu asla ölçülemiyordu. Artık pozisyon SADECE iki şeyle kapanır:
+#     TP4 (%20)  ya da  ORİJİNAL STOP (%2).
+# TP1/TP2/TP3 sadece kısmi realize + bildirimdir, pozisyonu kapatmaz.
+V11_TP4_PCT      = float(os.getenv("V11_TP4_PCT", "20.0"))
+LAB_BE_KAPAT     = os.getenv("LAB_BE_KAPAT", "false").lower() == "true"   # true=eski BE davranışı
+LAB_STOP_BE_TASI = os.getenv("LAB_STOP_BE_TASI", "false").lower() == "true"  # true=TP1'de stop girişe
+# Kısmi realize ağırlıkları (toplam 100). TP4 eklendiği için 50/30/20 yerine:
+LAB_TP_AGIRLIK   = [safe_float(x) for x in
+                    os.getenv("LAB_TP_AGIRLIK", "40,25,20,15").split(",")][:4]
+while len(LAB_TP_AGIRLIK) < 4:
+    LAB_TP_AGIRLIK.append(0.0)
+
+# --- ORİJİNAL EŞİKLER: silinmedi, sadece artık engellemiyor ---------------- #
+# Mesajda ve /esik komutunda bu tablo basılır; hangi eşiğin neyi keseceğini
+# hâlâ görürsün, ama kesmez.
+_ESIK_ORIJINAL: Dict[str, Any] = {
+    "V10_MIN_QUALITY (skor eşiği)":      V10_MIN_QUALITY,
+    "V11_RESEARCH_MIN (araştırma)":      V11_RESEARCH_MIN,
+    "V10_RSI_LONG_MAX":                  V10_RSI_LONG_MAX,
+    "V10_RSI_SHORT_MIN":                 V10_RSI_SHORT_MIN,
+    "V123_MIN_VOL_RATIO (hacim)":        V123_MIN_VOL_RATIO,
+    "V122_CVD_MIN_ALIGN (CVD)":          V122_CVD_MIN_ALIGN,
+    "V122_WHALE_MAX_OPPOSE (balina)":    V122_WHALE_MAX_OPPOSE,
+    "V11_MAX_SPREAD_BPS (spread)":       V11_MAX_SPREAD_BPS,
+    "V11_MAX_DRIFT_PCT (kayma)":         V11_MAX_DRIFT_PCT,
+    "V10_FOMO_MAX_MOVE (FOMO)":          V10_FOMO_MAX_MOVE,
+    "V10_FIB_MIN_DEPTH (fib)":           V10_FIB_MIN_DEPTH,
+    "V130_VOL_SPIKE_MULT (vol şok)":     V130_VOL_SPIKE_MULT,
+    "V126_REQUIRE_SWEEP (sweep şartı)":  V126_REQUIRE_SWEEP,
+    "V126_WAIT_RETEST (retest bekle)":   V126_WAIT_RETEST,
+    "V10_USE_4H_FILTER (4H uyumu)":      V10_USE_4H_FILTER,
+    "V11_REQUIRE_BTC_ALIGN (BTC uyumu)": V11_REQUIRE_BTC_ALIGN,
+    "V130_DAILY_HARD (1D rejim)":        V130_DAILY_HARD,
+    "V122_BLOCK_ON_SPOOF (spoof)":       V122_BLOCK_ON_SPOOF,
+    "V123_VOL_HARD_GATE (hacim kapı)":   V123_VOL_HARD_GATE,
+    "V11_MAX_SIGNALS_PER_COIN_DAY":      V11_MAX_SIGNALS_PER_COIN_DAY,
+    "V11_REENTRY_HOURS":                 V11_REENTRY_HOURS,
+    "V11_STOP_BOX_HOURS":                V11_STOP_BOX_HOURS,
+    "V10_ALERT_COOLDOWN_MIN":            V10_ALERT_COOLDOWN_MIN,
+}
+
+# --- ENGELLEME EŞİKLERİNİ SIFIRLA ------------------------------------------ #
+# DİKKAT: burada sıfırlananlar SADECE "sinyali durdur" anahtarlarıdır.
+# Ölçüm eşikleri (RSI bandı, skor, hacim oranı, CVD hizası...) DOKUNULMADAN
+# kalır — çünkü lab["g_*"] bayrakları onlarla hesaplanıyor. Bayrağı bozarsak
+# 2.000 kapanış sonunda "hangi kapı işe yarardı" sorusunu cevaplayamayız.
+if LAB_FILTRESIZ:
+    V126_REQUIRE_SWEEP    = False   # sweep yoksa da geç
+    V126_WAIT_RETEST      = False   # retest bekleme yok, tetikte gir
+    V122_REQUIRE_CVD      = False   # CVD ters olsa da geç
+    V122_BLOCK_ON_SPOOF   = False   # spoof riski olsa da geç
+    V123_VOL_HARD_GATE    = False   # hacim düşük olsa da geç
+    V130_DAILY_HARD       = False   # 1D rejime ters olsa da geç
+    V11_REQUIRE_BTC_ALIGN = False   # BTC ters olsa da geç  ← "btc uyumlu olsun olmasın"
+    V11_NEWS_REVERSE      = False   # haber tek başına yön çevirmesin
+    V10_LEARN_AUTO_ADJUST = False   # bot kendi kendine eşik YÜKSELTMESİN
+    V10_FIB_MIN_DEPTH     = 0.0     # sığ fib de geçsin
+    V11_RSI_STRICT        = False   # RSI akıl sağlığı kapısı kapalı
+    # Aşağıdaki üçü ÖLÇÜM için açık kalır; LAB_MODE zaten engellemelerini
+    # devre dışı bırakıyor (bkz. v10_structure_gate / analyze_v10_symbol):
+    #   V11_BLOCK_RANGE_BOS, V11_CHOCH_NEEDS_CONFIRM, V130_VOL_SHIELD
+    logger.warning("LAB v2 TAM FİLTRESİZ MOD AÇIK — hiçbir kapı sinyal engellemiyor. "
+                   "Sadece ölçüm yapılıyor. Canlı işlem için kullanma.")
+
+
+def lab_sira_al() -> int:
+    """Her sinyale kalıcı, artan bir SIRA numarası verir.
+    Sinyal mesajında da, TP/STOP mesajında da aynı numara görünür — böylece
+    'sıra 412 neydi' sorusu tek bakışta cevaplanır. Deploy'a dayanıklı
+    (memory.json'da tutulur)."""
+    d = memory.setdefault("lab", {})
+    n = int(safe_float(d.get("sira"))) + 1
+    d["sira"] = n
+    return n
+
+
+def lab_esik_ozeti() -> str:
+    """Eşikler SİLİNMEDİ — bu tablo onların hâlâ kodda durduğunun kanıtı."""
+    L = ["🔎 FİLTRELER VE EŞİKLERİ (kodda duruyor, ENGELLEMİYOR)"]
+    for k, v in _ESIK_ORIJINAL.items():
+        L.append(f"• {k}: {v}")
+    L.append("")
+    L.append(f"Engelleme eşiği: 0 (LAB_FILTRESIZ={'AÇIK' if LAB_FILTRESIZ else 'kapalı'})")
+    L.append("Her kapı hâlâ HESAPLANIYOR ve deftere yazılıyor; sadece kimseyi durdurmuyor.")
+    return "\n".join(L)
+
+
 class V10Swing:
     __slots__ = ("idx", "price", "kind")
     def __init__(self, idx, price, kind):
@@ -7526,20 +7662,26 @@ def v10_targets(side, entry, a, fib=None):
         tp1 = entry + sgn*entry*(V11_TP1_PCT/100.0)
         tp2 = entry + sgn*entry*(V11_TP2_PCT/100.0)
         tp3 = entry + sgn*entry*(V11_TP3_PCT/100.0)
+        tp4 = entry + sgn*entry*(V11_TP4_PCT/100.0)   # LAB v2: %20 — "nereye kadar gider"
         return {"stop":stop,"stop_pct":round(V11_STOP_PCT,3),"risk":risk,
-                "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp_kaynak":"%SABİT",
+                "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp4":tp4,"tp_kaynak":"%SABİT",
                 "tp1_pct":V11_TP1_PCT,"tp2_pct":V11_TP2_PCT,"tp3_pct":V11_TP3_PCT,
+                "tp4_pct":V11_TP4_PCT,
                 "tp1_rr":round(abs(tp1-entry)/risk,2) if risk > 0 else 0,
                 "tp2_rr":round(abs(tp2-entry)/risk,2) if risk > 0 else 0,
-                "tp3_rr":round(abs(tp3-entry)/risk,2) if risk > 0 else 0}
+                "tp3_rr":round(abs(tp3-entry)/risk,2) if risk > 0 else 0,
+                "tp4_rr":round(abs(tp4-entry)/risk,2) if risk > 0 else 0}
 
     dist = min(max(a*V10_ATR_MULT, entry*V10_STOP_MIN_PCT), entry*V10_STOP_MAX_PCT)
     stop = entry-dist if side == "LONG" else entry+dist
     risk = abs(entry-stop)
+    sgn2 = 1.0 if side == "LONG" else -1.0
     if side == "LONG":
         tp1, tp2, tp3 = entry+risk*V10_TP1_RR, entry+risk*V10_TP2_RR, entry+risk*V10_TP3_RR
     else:
         tp1, tp2, tp3 = entry-risk*V10_TP1_RR, entry-risk*V10_TP2_RR, entry-risk*V10_TP3_RR
+    # LAB v2: TP4 her modda VAR ve her zaman sabit %20 uzaklıkta — mandat bu.
+    tp4 = entry + sgn2*entry*(V11_TP4_PCT/100.0)
     tp_kaynak = "ATR"
     if fib and V11_TARGET_MODE == "fib":
         def _rr(px):
@@ -7549,9 +7691,11 @@ def v10_targets(side, entry, a, fib=None):
             tp2, tp3 = f2, f3
             tp_kaynak = "FİB"
     return {"stop":stop,"stop_pct":round(dist/entry*100,3),"risk":risk,
-            "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp_kaynak":tp_kaynak,
+            "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp4":tp4,"tp_kaynak":tp_kaynak,
+            "tp4_pct":V11_TP4_PCT,
             "tp1_rr":round(abs(tp1-entry)/risk,2),
-            "tp2_rr":round(abs(tp2-entry)/risk,2),"tp3_rr":round(abs(tp3-entry)/risk,2)}
+            "tp2_rr":round(abs(tp2-entry)/risk,2),"tp3_rr":round(abs(tp3-entry)/risk,2),
+            "tp4_rr":round(abs(tp4-entry)/risk,2) if risk > 0 else 0}
 
 
 async def v10_fetch_orderbook(symbol):
@@ -7765,9 +7909,16 @@ def v10_structure_gate(symbol, k1h, k4h, erken=False):
     for side in ("LONG", "SHORT"):
         ok, why = v10_structure_allows(side, ms)
         if not ok: continue
+        # --- 4H UYUM KAPISI: LAB'da ENGELLEMEZ, sadece işaretlenir ---------
+        # Hasan mandatı: "btc uyumlu olsun olmasın gelsin sinyal". Aynı mantık
+        # coinin kendi 4H trendi için de geçerli — ölçüyoruz, kesmiyoruz.
         if V10_USE_4H_FILTER and trend4 != "FLAT":
-            if side == "LONG" and trend4 != "UP": continue
-            if side == "SHORT" and trend4 != "DOWN": continue
+            _ters4 = ((side == "LONG" and trend4 != "UP") or
+                      (side == "SHORT" and trend4 != "DOWN"))
+            if _ters4:
+                stats["v10_red_4h"] = int(stats.get("v10_red_4h", 0)) + 1
+                if not LAB_MODE: continue
+                _LAB_GATE["4h"] = 0
 
         # --- V11 KAPI 1: RANGE içi kırılım yasağı -------------------------
         # 27-28 Tem defteri: 1H:RANGE etiketli "BOS (devam)" sinyallerinin
@@ -7795,7 +7946,11 @@ def v10_structure_gate(symbol, k1h, k4h, erken=False):
             why = why + " +sweep"
 
         blk, mv = v10_fomo_block(side, k)
-        if blk: continue
+        if blk:
+            stats["v10_red_fomo"] = int(stats.get("v10_red_fomo", 0)) + 1
+            v131_say("fomo")
+            if not LAB_MODE: continue
+            _LAB_GATE["fomo"] = 0
 
         # V12.6 ŞART: likidite süpürmesi ZORUNLU. Eskiden sadece 7 puanlık
         # skor bileşeniydi; süpürülmemiş bir seviyenin kırılması "stop avı
@@ -7816,7 +7971,10 @@ def v10_structure_gate(symbol, k1h, k4h, erken=False):
             note = "retest bekleniyor"
         else:
             pb, note = v10_pullback(side, k, ms)
-            if not pb: continue
+            if not pb:
+                # LAB: pullback yoksa da gir; sadece not düş.
+                if not LAB_MODE: continue
+                note = (note or "pullback yok") + " (LAB: beklenmedi)"
         return {"side":side,"ms":ms,"why":why,"trend4":trend4,"fomo":round(mv,2),
                 "pullback":note,"k":k,"range_break":bool(ms.get("range_break")),
                 "erken":bool(erken),"lvl":safe_float(ms.get("event_level"))}
@@ -8043,6 +8201,12 @@ async def v11_deep_research(sig: Dict[str, Any], k1h: List[List[Any]]) -> Dict[s
     elif S < V11_RESEARCH_MIN:
         out["verdict"] = "RED"
         out["red"].append(f"araştırma puanı {S:.0f} < {V11_RESEARCH_MIN:.0f}")
+    # --- LAB v2: KARAR ÖLÇÜLÜR, UYGULANMAZ -------------------------------
+    # Gerçek karar kaybolmuyor (gercek_verdict + red listesi mesajda basılıyor
+    # ve deftere yazılıyor); sadece artık sinyali DURDURMUYOR.
+    out["gercek_verdict"] = out["verdict"]
+    if LAB_FILTRESIZ:
+        out["verdict"] = "ONAY"
     return out
 
 
@@ -8413,7 +8577,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         v131_say("yapi")
         return None
     side = gate["side"]; k = gate["k"]
-    for _g in ("range", "choch", "sweep"):
+    for _g in ("range", "choch", "sweep", "4h", "fomo"):
         if _g in _LAB_GATE: lab["g_" + _g] = _LAB_GATE[_g]
     lab["sweep"] = 1 if safe_float(_LAB_GATE.get("sweep_deger")) >= 1.0 else 0
     tetik = (f"{V122_STRUCT_TF} SÜPÜRME DÖNÜŞÜ" if reversal
@@ -8531,7 +8695,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         parts["fib"] = fib["bonus"]
     if V10_FIB_ENABLED and V10_FIB_MIN_DEPTH > 0 and (not fib or fib["depth"] < V10_FIB_MIN_DEPTH):
         stats["v10_red_fib"] = int(stats.get("v10_red_fib", 0)) + 1
-        return None
+        if not LAB_MODE: return None
     if score > safe_float(stats.get("v10_best_score", 0)):
         stats["v10_best_score"] = round(score, 1)
     if (side == "LONG" and r > V10_RSI_LONG_MAX) or (side == "SHORT" and r < V10_RSI_SHORT_MIN):
@@ -8633,20 +8797,25 @@ def build_v10_message(sig):
         fib_line = (f"Fib: derinlik %{round(safe_float(sig.get('fib_depth'))*100)} → "
                 f"{sig['fib_zone']} ({safe_float(sig.get('fib_bonus')):+.0f} puan)\n")
 
-    tp_line = (f"TP1 {_v10_fmt(sig['tp1'])} (%{V11_TP1_PCT:g} · {sig.get('tp1_rr',0)}R · çık %50)\n"
-               f"TP2 {_v10_fmt(sig['tp2'])} (%{V11_TP2_PCT:g} · {sig.get('tp2_rr',0)}R · çık %30)\n"
-               f"TP3 {_v10_fmt(sig['tp3'])} (%{V11_TP3_PCT:g} · {sig.get('tp3_rr',0)}R · çık %20)\n"
+    w1, w2, w3, w4 = (LAB_TP_AGIRLIK + [0, 0, 0, 0])[:4]
+    tp_line = (f"TP1 {_v10_fmt(sig['tp1'])} (%{V11_TP1_PCT:g} · {sig.get('tp1_rr',0)}R · çık %{w1:g})\n"
+               f"TP2 {_v10_fmt(sig['tp2'])} (%{V11_TP2_PCT:g} · {sig.get('tp2_rr',0)}R · çık %{w2:g})\n"
+               f"TP3 {_v10_fmt(sig['tp3'])} (%{V11_TP3_PCT:g} · {sig.get('tp3_rr',0)}R · çık %{w3:g}) → KAPANMAZ\n"
+               f"TP4 {_v10_fmt(sig.get('tp4'))} (%{V11_TP4_PCT:g} · {sig.get('tp4_rr',0)}R · çık %{w4:g}) ⬅ SON HEDEF\n"
                if sig.get("tp_kaynak") == "%SABİT" else
-               f"TP1 {_v10_fmt(sig['tp1'])} ({sig.get('tp1_rr',1)}R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr',0)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr',0)}R %20) [{sig.get('tp_kaynak','ATR')}]\n")
+               f"TP1 {_v10_fmt(sig['tp1'])} ({sig.get('tp1_rr',1)}R %{w1:g}) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr',0)}R %{w2:g}) | "
+               f"TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr',0)}R %{w3:g}) | TP4 {_v10_fmt(sig.get('tp4'))} (%{V11_TP4_PCT:g}) [{sig.get('tp_kaynak','ATR')}]\n")
 
     rs = sig.get("research") or {}
     res_line = ""
     if rs:
         notes = rs.get("notes", [])[:7]
+        _gv = rs.get("gercek_verdict", rs.get("verdict", "ONAY"))
         res_line = (f"🔬 Araştırma: {rs.get('score',0)}/100 "
                     + (f"(ham {rs.get('ham')}/{rs.get('tavan')}) " if rs.get("tavan") else "")
-                    + "— ONAY\n"
-                    + "".join(f"   {_v123_isaret(n)} {n}\n" for n in notes))
+                    + (f"— {_gv} (engellenmedi)\n" if _gv != "ONAY" else "— ONAY\n")
+                    + "".join(f"   {_v123_isaret(n)} {n}\n" for n in notes)
+                    + "".join(f"   ⛔ {r}\n" for r in (rs.get("red") or [])[:4]))
     gr = (rs.get("grafik") or {}) if rs else {}
     wh = (rs.get("whale") or {}) if rs else {}
     if gr and gr.get("notlar"):
@@ -8661,7 +8830,20 @@ def build_v10_message(sig):
     if news and news.get("n"):
         news_line = f"📰 Haber tonu: {news.get('label')} ({news.get('score'):+.1f}) — {news.get('n')} başlık\n"
 
+    # --- LAB v2: hangi kapılar bu sinyali KESERDİ? (engellemiyor, sadece not) ---
+    _lb = sig.get("lab") or {}
+    _ad = {"yapi":"Yapı","range":"RANGE kırılım","choch":"CHoCH teyidi","sweep":"Sweep",
+           "retest":"Retest","cvd":"CVD","balina":"Balina","spoof":"Spoof","hacim":"Hacim",
+           "spread":"Spread","btc":"BTC uyumu","4h":"4H uyumu","fomo":"FOMO","rsi":"RSI",
+           "skor":"Skor eşiği","arastirma":"Araştırma","1d":"1D rejim","volsok":"Vol şok",
+           "drift":"Kayma","tekrar":"Tekrar kilidi"}
+    _kesen = [_ad.get(k[2:], k[2:]) for k, v in _lb.items()
+              if k.startswith("g_") and int(safe_float(v, 1)) == 0]
+    kapi_line = ("🚫 Normalde KESERDİ: " + ", ".join(_kesen) + "\n"
+                 if _kesen else "✅ Hiçbir kapı kesmezdi (tüm filtreler uyumlu)\n")
+
     return (f"🎯 {VERSION_NAME}\n"
+            f"🔢 SIRA {int(safe_float(sig.get('sira')))}  |  📅 {sig.get('acilis_saat') or tr_str()}\n"
             f"🆕 {sig.get('setup','KIRILIM')} | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | {sig.get('struct_tf','15m')}:{sig.get('trend_struct','-')}"
             f" 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
@@ -8679,27 +8861,40 @@ def build_v10_message(sig):
             + (f"🔁 Retest: {sig['retest_not']}\n" if sig.get("retest_not") else "")
             + f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
             f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
-            f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
+            + kapi_line
+            + (f"🧪 FİLTRESİZ LAB — hiçbir kapı engellemedi (skor {sig['score']} olsa da geçer)\n"
+               if LAB_FILTRESIZ else "")
+            + f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
 
 
 def build_v10_close_message(pos, R, outcome, exit_price):
     if outcome == "STOP":
         head = "❌ STOP GELDİ"
+    elif outcome == "TP4":
+        head = "🏆 TP4 GELDİ — %20 TAM HEDEF"
     elif outcome == "TP3":
-        head = "✅ TP3 GELDİ — tam hedef"
+        head = "✅ TP3 GELDİ"
     elif outcome == "BE":
         head = "⚖️ BREAKEVEN — TP1 sonrası girişe döndü"
     else:
         head = f"🏁 {outcome}"
+    ulasilan = " ".join(
+        (f"TP{i}✅" if pos.get(f"hit{i}") else f"TP{i}▫️") for i in (1, 2, 3, 4))
+    sure = (time.time() - safe_float(pos.get("open_ts"))) / 60.0
     return (
-        f"🆕 V10 SMC — POZİSYON KAPANDI\n"
+        f"🆕 LAB v2 — POZİSYON KAPANDI\n"
         f"{head}\n"
+        f"🔢 SIRA {int(safe_float(pos.get('sira')))}\n"
         f"Coin: {pos['symbol']}\n"
         f"Yön: {pos['side']}\n"
         f"Giriş: {_v10_fmt(pos['entry'])}\n"
         f"Çıkış: {_v10_fmt(exit_price)}\n"
+        f"Hedefler: {ulasilan}\n"
+        f"En uzak gidiş: +%{safe_float(pos.get('mfe_pct')):.2f} lehe / "
+        f"-%{safe_float(pos.get('mae_pct')):.2f} aleyhe\n"
         f"Sonuç: {R:+.2f}R (skor {pos['score']})\n"
-        f"Saat: {tr_str()}"
+        f"📅 Açılış: {pos.get('acilis_saat') or '-'}\n"
+        f"📅 Kapanış: {tr_str()}  ({sure:.0f} dk açık kaldı)"
     )
 
 def v10_score_band(s):
@@ -8720,10 +8915,18 @@ def v10_open_paper(sig):
         "symbol":sig["symbol"],"side":sig["direction"],"entry":sig["entry"],
         "orig_stop":sig["stop"],"stop":sig["stop"],
         "tp1":sig["tp1"],"tp2":sig["tp2"],"tp3":sig["tp3"],
+        "tp4":safe_float(sig.get("tp4")),
         "tp1_rr":safe_float(sig.get("tp1_rr"), V10_TP1_RR),
         "tp2_rr":safe_float(sig.get("tp2_rr"), V10_TP2_RR),
         "tp3_rr":safe_float(sig.get("tp3_rr"), V10_TP3_RR),
-        "hit1":False,"hit2":False,"hit3":False,"realized":0.0,
+        "tp4_rr":safe_float(sig.get("tp4_rr"), 10.0),
+        "hit1":False,"hit2":False,"hit3":False,"hit4":False,"realized":0.0,
+        # LAB v2: SIRA NO — sinyal mesajı ile TP/STOP mesajını birbirine bağlar
+        "sira":int(safe_float(sig.get("sira"))),
+        "acilis_saat":sig.get("acilis_saat") or tr_str(),
+        # LAB v2: MFE = pozisyonun LEHE gittiği en uzak nokta (%).
+        # "Bu sinyal nereye kadar giderdi?" sorusunun doğrudan cevabı.
+        "mfe_pct":0.0,"mae_pct":0.0,
         "score":sig["score"],"event":sig["event"],
         "research":safe_float((sig.get("research") or {}).get("score")),
         "bucket":f'{sig["event"]}|{v10_score_band(sig["score"])}',
@@ -8731,42 +8934,101 @@ def v10_open_paper(sig):
         "open_ts":time.time(),"candle_ts":sig["candle_ts"]})
 
 
+def _lab_tp4(pos):
+    """Eski (v1) defterden gelen pozisyonlarda tp4 yoktur — türet."""
+    t4 = safe_float(pos.get("tp4"))
+    if t4 > 0:
+        return t4
+    e = safe_float(pos.get("entry"))
+    sgn = 1.0 if pos.get("side") == "LONG" else -1.0
+    return e + sgn * e * (V11_TP4_PCT / 100.0)
+
+
 def v10_check_paper(pos, price, hi=None, lo=None):
-    """V11 DÜZELTME: dolumlar artık mumun FİTİLLERİNE bakıyor.
-    Eski kod sadece anlık kapanışa bakıyordu; mum içinde stopa değip dönen ya da
-    TP1'i teğet geçen hareketler defterde hiç görünmüyordu. Aynı mumda hem stop
-    hem TP1 dokunulmuşsa hangisinin önce olduğunu bilemeyiz → temkinli kural:
-    STOP önce sayılır. Defter böylece iyimser değil, gerçekçi olur."""
-    side = pos["side"]; e = pos["entry"]; w = {"tp1":0.5,"tp2":0.3,"tp3":0.2}
+    """LAB v2 — "TP1 gelince DEVAM" mandatı.
+
+    ESKİ DAVRANIŞ (kaldırıldı): TP1'de stop girişe çekiliyor, fiyat girişe
+    dönünce pozisyon BE ile KAPANIYORDU; TP3'te de kapanıyordu. Bu yüzden
+    "bu sinyal aslında nereye kadar giderdi?" sorusu ölçülemiyordu.
+
+    YENİ DAVRANIŞ: pozisyon SADECE iki şeyle kapanır →
+        TP4 (%20)   ya da   ORİJİNAL STOP (%2)
+    TP1/TP2/TP3 kısmi realize + bildirimdir, pozisyonu KAPATMAZ. TP3 geçilse
+    bile pozisyon açık kalır ve TP4'e kadar takip edilir.
+
+    R MUHASEBESİ (dürüst kalsın diye): her TP'de o dilimin ağırlığı kadar kâr
+    yazılır; stop gelirse KALAN dilim -1R yer. Yani TP1+TP2 alıp sonra stop
+    olan bir işlem artık "-1R" değil, gerçek net sonucunu yazar.
+
+    FİTİL KURALI korundu: aynı mumda hem stop hem TP dokunulmuşsa hangisinin
+    önce olduğu bilinemez → STOP önce sayılır. Defter iyimser değil, gerçekçi.
+    """
+    side = pos["side"]; e = safe_float(pos["entry"])
+    w1, w2, w3, w4 = (LAB_TP_AGIRLIK + [0, 0, 0, 0])[:4]
+    toplam_w = (w1 + w2 + w3 + w4) or 100.0
+    w1, w2, w3, w4 = w1/toplam_w, w2/toplam_w, w3/toplam_w, w4/toplam_w
     hi = safe_float(hi) if hi else safe_float(price)
     lo = safe_float(lo) if lo else safe_float(price)
     hi = max(hi, safe_float(price)); lo = min(lo, safe_float(price))
-    if side == "LONG":
-        if not pos["hit1"] and lo <= pos["orig_stop"]: return -1.0, "STOP"
-        if pos["hit1"] and lo <= e: return pos["realized"], "BE"
-        if not pos["hit1"] and hi >= pos["tp1"]:
-            pos["hit1"]=True; pos["realized"]+=w["tp1"]*pos["tp1_rr"]; pos["stop"]=e
-        if pos["hit1"] and not pos["hit2"] and hi >= pos["tp2"]:
-            pos["hit2"]=True; pos["realized"]+=w["tp2"]*pos["tp2_rr"]
-        if pos["hit2"] and not pos["hit3"] and hi >= pos["tp3"]:
-            pos["hit3"]=True; pos["realized"]+=w["tp3"]*pos["tp3_rr"]; return pos["realized"], "TP3"
-    else:
-        if not pos["hit1"] and hi >= pos["orig_stop"]: return -1.0, "STOP"
-        if pos["hit1"] and hi >= e: return pos["realized"], "BE"
-        if not pos["hit1"] and lo <= pos["tp1"]:
-            pos["hit1"]=True; pos["realized"]+=w["tp1"]*pos["tp1_rr"]; pos["stop"]=e
-        if pos["hit1"] and not pos["hit2"] and lo <= pos["tp2"]:
-            pos["hit2"]=True; pos["realized"]+=w["tp2"]*pos["tp2_rr"]
-        if pos["hit2"] and not pos["hit3"] and lo <= pos["tp3"]:
-            pos["hit3"]=True; pos["realized"]+=w["tp3"]*pos["tp3_rr"]; return pos["realized"], "TP3"
+    tp4 = _lab_tp4(pos)
+    pos.setdefault("hit4", False)
+    up = (side == "LONG")
+
+    # --- MFE / MAE: "nereye kadar gitti" ölçümü (her turda güncellenir) ----
+    if e > 0:
+        lehe  = ((hi - e) / e * 100.0) if up else ((e - lo) / e * 100.0)
+        aleyh = ((e - lo) / e * 100.0) if up else ((hi - e) / e * 100.0)
+        if lehe  > safe_float(pos.get("mfe_pct")): pos["mfe_pct"] = round(lehe, 3)
+        if aleyh > safe_float(pos.get("mae_pct")): pos["mae_pct"] = round(aleyh, 3)
+
+    def _kalan():
+        k = 1.0
+        if pos.get("hit1"): k -= w1
+        if pos.get("hit2"): k -= w2
+        if pos.get("hit3"): k -= w3
+        if pos.get("hit4"): k -= w4
+        return max(0.0, k)
+
+    # --- STOP: TP1 sonrası da geçerli (stop artık girişe ÇEKİLMİYOR) ------
+    stop_seviye = safe_float(pos.get("stop")) if LAB_STOP_BE_TASI else safe_float(pos["orig_stop"])
+    vuruldu = (lo <= stop_seviye) if up else (hi >= stop_seviye)
+    if vuruldu:
+        return round(safe_float(pos.get("realized")) - _kalan(), 4), "STOP"
+
+    # --- Eski BE davranışı: sadece LAB_BE_KAPAT=true ile geri gelir --------
+    if LAB_BE_KAPAT and pos.get("hit1"):
+        if (lo <= e) if up else (hi >= e):
+            return round(safe_float(pos.get("realized")), 4), "BE"
+
+    ulasti = (lambda t: hi >= t) if up else (lambda t: lo <= t)
+
+    if not pos.get("hit1") and ulasti(pos["tp1"]):
+        pos["hit1"] = True
+        pos["realized"] = safe_float(pos.get("realized")) + w1*safe_float(pos.get("tp1_rr"))
+        if LAB_STOP_BE_TASI:
+            pos["stop"] = e
+    if pos.get("hit1") and not pos.get("hit2") and ulasti(pos["tp2"]):
+        pos["hit2"] = True
+        pos["realized"] = safe_float(pos.get("realized")) + w2*safe_float(pos.get("tp2_rr"))
+    if pos.get("hit2") and not pos.get("hit3") and ulasti(pos["tp3"]):
+        pos["hit3"] = True
+        pos["realized"] = safe_float(pos.get("realized")) + w3*safe_float(pos.get("tp3_rr"))
+        # TP3 ARTIK KAPATMIYOR — mandat: "tp3 geçse bile hâlâ devam"
+    if pos.get("hit3") and not pos.get("hit4") and ulasti(tp4):
+        pos["hit4"] = True
+        pos["realized"] = safe_float(pos.get("realized")) + w4*safe_float(pos.get("tp4_rr"), 10.0)
+        return round(safe_float(pos["realized"]), 4), "TP4"
     return None, None
 
 
 def v10_record_closed(pos, R, outcome):
     mp = _v10_mem()
     mp["closed"].append({"symbol":pos["symbol"],"side":pos["side"],"R":round(R,3),
-        "outcome":outcome,
-        "hit1":bool(pos.get("hit1")),"hit2":bool(pos.get("hit2")),"hit3":bool(pos.get("hit3")),"score":pos["score"],"event":pos["event"],
+        "outcome":outcome,"sira":int(safe_float(pos.get("sira"))),
+        "hit1":bool(pos.get("hit1")),"hit2":bool(pos.get("hit2")),
+        "hit3":bool(pos.get("hit3")),"hit4":bool(pos.get("hit4")),
+        "mfe_pct":safe_float(pos.get("mfe_pct")),"mae_pct":safe_float(pos.get("mae_pct")),
+        "score":pos["score"],"event":pos["event"],
         "bucket":pos["bucket"],"close_ts":time.time()})
     b = mp["buckets"].setdefault(pos["bucket"], {"n":0,"R":0.0,"win":0})
     b["n"] += 1; b["R"] = round(b["R"]+R, 3)
@@ -8899,7 +9161,7 @@ async def maybe_send_v10_signal(sig):
         stats["v11_red_arastirma"] = int(stats.get("v11_red_arastirma", 0)) + 1
         v131_say("arastirma")
         stats["v11_son_red"] = f"{side} {symbol}: " + "; ".join(research.get("red", [])[:2])
-        if research["verdict"] == "TERS":
+        if research["verdict"] == "TERS" and not LAB_FILTRESIZ:
             stats["v11_ters_aday"] = int(stats.get("v11_ters_aday", 0)) + 1
             await safe_send_telegram(
                 f"🔄 V11 TERS HABER UYARISI — {symbol}\n"
@@ -8915,7 +9177,37 @@ async def maybe_send_v10_signal(sig):
         if not LAB_MODE: return
 
     sig["research"] = research
-    # ═══ LAB: sinyal Telegram'a GİTMEZ, doğrudan deftere yazılır ═══
+
+    # --- ÖLÇÜM: araştırma notlarını ve KIRMIZILARI kapı bayrağına çevir -----
+    # Bunlar sinyali ENGELLEMİYOR; sadece "bu kapı olsaydı keserdi" diye
+    # deftere yazılıyor. /kazanan raporu tamamen buna dayanıyor.
+    try:
+        for _n in (research.get("notes") or []):
+            if "hacim x" in _n:
+                lab["hacim_orani"] = safe_float(_n.split("hacim x")[1].split()[0])
+            if "aralık konumu %" in _n:
+                lab["aralik_konum"] = safe_float(_n.split("aralık konumu %")[1].split()[0])
+        for _r in (research.get("red") or []):
+            rl = _v11_lower(_r)
+            if "hacim" in rl:            lab["g_hacim"] = 0
+            elif "spread" in rl:         lab["g_spread"] = 0
+            elif "btc" in rl:            lab["g_btc"] = 0
+            elif "haber" in rl:          lab["g_arastirma"] = 0
+            elif "15m" in rl:            lab["g_arastirma"] = 0
+            elif "aralığın" in rl:       lab["g_arastirma"] = 0
+            else:                        lab["g_arastirma"] = 0
+        if research.get("gercek_verdict", research.get("verdict")) != "ONAY":
+            lab["g_arastirma"] = 0
+    except Exception:
+        pass
+
+    # --- SIRA NUMARASI: sinyal ve TP/STOP mesajını birbirine bağlar --------
+    sig["sira"] = lab_sira_al()
+    sig["acilis_saat"] = tr_str()
+
+    # ═══ LAB v2: sinyalin KENDİSİ de Telegram'a gider ═══
+    # v1'de sadece TP/STOP mesajı geliyordu, sinyalin kendisi sessizce
+    # SQLite'a yazılıyordu (Hasan'ın bildirdiği kusur). Artık sinyal de gelir.
     if LAB_MODE:
         mp = _v10_mem()
         if len(mp.get("open", [])) >= LAB_MAX_OPEN:
@@ -8928,19 +9220,25 @@ async def maybe_send_v10_signal(sig):
         sig["lab_id"] = lab_kaydet(sig, lab, str(lab.get("giris_tipi") or "TETIK"))
         v10_open_paper(sig)
         stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
+        stats["last_signal"] = (f"SIRA {sig['sira']} {side} {symbol} "
+                                f"skor {sig['score']} (arş {research['score']})")
         v131_say("GONDERILDI")
+        if LAB_TELEGRAM:
+            if LAB_GRAFIK:
+                await send_rich_signal(
+                    build_v10_message(sig), symbol, side,
+                    entry=safe_float(sig.get("entry")), stop=safe_float(sig.get("stop")),
+                    tps={"TP1": sig.get("tp1"), "TP2": sig.get("tp2"),
+                         "TP3": sig.get("tp3"), "TP4": sig.get("tp4")},
+                    meta={"score": sig.get("score"), "rsi": sig.get("rsi"),
+                          "funding": sig.get("funding"), "oi": sig.get("oi_change_pct")})
+            else:
+                # Düz metin: filtresiz modda günde yüzlerce sinyal olacak;
+                # grafik üretimi + foto yükleme Telegram limitine takılır.
+                # Grafik istersen LAB_GRAFIK=true.
+                await safe_send_telegram(build_v10_message(sig))
+        logger.info("LAB SİNYAL #%s %s %s skor=%s", sig["sira"], side, symbol, sig["score"])
         return
-    try:
-        _lb = sig.get("lab") or {}
-        for _n in (research.get("notes") or []):
-            if "hacim x" in _n:
-                _lb["hacim_orani"] = safe_float(_n.split("hacim x")[1].split()[0])
-            if "aralık konumu %" in _n:
-                _lb["aralik_konum"] = safe_float(_n.split("aralık konumu %")[1].split()[0])
-        if research.get("verdict") != "ONAY":
-            _lb["g_arastirma"] = 0
-    except Exception:
-        pass
     ok = await send_rich_signal(
         build_v10_message(sig), symbol, side,
         entry=safe_float(sig.get("entry")), stop=safe_float(sig.get("stop")),
@@ -9048,6 +9346,20 @@ async def v10_scan_loop() -> None:
         await asyncio.sleep(max(5.0, MA_SCAN_INTERVAL_SEC))
 
 
+def build_lab_tp_message(pos, n: int) -> str:
+    """TP1/TP2/TP3 ara bildirimi — pozisyon KAPANMAZ, sadece haber verir."""
+    w = (LAB_TP_AGIRLIK + [0, 0, 0, 0])[:4]
+    hedef = safe_float(pos.get(f"tp{n}")) or (_lab_tp4(pos) if n == 4 else 0.0)
+    yuzde = {1: V11_TP1_PCT, 2: V11_TP2_PCT, 3: V11_TP3_PCT, 4: V11_TP4_PCT}[n]
+    return (f"✅ TP{n} GELDİ (%{yuzde:g}) — {pos['side']} {pos['symbol']}\n"
+            f"🔢 SIRA {int(safe_float(pos.get('sira')))}\n"
+            f"Fiyat: {_v10_fmt(hedef)} | %{w[n-1]:g} realize\n"
+            f"Kilitlenen: +{safe_float(pos.get('realized')):.2f}R | skor {pos['score']}\n"
+            f"▶️ POZİSYON AÇIK KALIYOR — hedef TP4 (%{V11_TP4_PCT:g})\n"
+            f"📅 Açılış: {pos.get('acilis_saat') or '-'}\n"
+            f"📅 Şimdi: {tr_str()}")
+
+
 async def v10_paper_loop() -> None:
     if not V10_ENGINE_ENABLED:
         return
@@ -9055,42 +9367,64 @@ async def v10_paper_loop() -> None:
     while True:
         try:
             mp = _v10_mem()
+            # DÜZELTME (LAB v2): eski kod mp["open"] üzerinde await'li döngü
+            # kurup sonunda mp["open"] = still yazıyordu. Döngü sürerken
+            # AÇILAN yeni pozisyonlar bu atamayla siliniyordu → sinyal
+            # Telegram'a ve LAB'a gidiyor ama asla takip edilmiyordu
+            # (hayalet pozisyon). Filtresiz modda sinyal hızı arttığı için
+            # bu kusur sistematik veri kaybına dönerdi. Artık işlenen küme
+            # kimlikle izleniyor, yeni gelenler korunuyor.
+            acik = list(mp["open"])
+            islenen = {id(p) for p in acik}
             still = []
-            for pos in mp["open"]:
-                k = await get_klines(pos["symbol"], MA_KLINE_INTERVAL, 3)
-                if not k:
-                    still.append(pos); continue
-                was1, was2 = pos["hit1"], pos["hit2"]
-                last = k[-1]
-                R, oc = v10_check_paper(pos, closes(k)[-1],
-                                        safe_float(last[2]), safe_float(last[3]))
-                if not oc:
-                    if pos["hit1"] and not was1:
-                        await safe_send_telegram(
-                            f"✅ V10 TP1 GELDİ — {pos['side']} {pos['symbol']}\n"
-                            f"Fiyat: {_v10_fmt(pos['tp1'])} | %50 realize\n"
-                            f"Stop girişe çekildi (artık zararsız) | +{round(pos['realized'],2)}R kilitli | skor {pos['score']}")
-                    if pos["hit2"] and not was2:
-                        await safe_send_telegram(
-                            f"✅ V10 TP2 GELDİ — {pos['side']} {pos['symbol']}\n"
-                            f"Fiyat: {_v10_fmt(pos['tp2'])} | %30 realize | +{round(pos['realized'],2)}R kilitli | skor {pos['score']}")
-                    still.append(pos)
-                    continue
-                v10_record_closed(pos, R, oc)
-                v130_kaydet_kapanis(pos, R, oc)
-                lab_kapat(pos, R, oc)
-                if oc == "STOP":
-                    v11_register_stop(pos["symbol"], pos["side"])   # V11 ceza kutusu
-                exit_price = pos["orig_stop"] if oc == "STOP" else (pos["tp3"] if oc == "TP3" else pos["entry"])
-                await safe_send_telegram(build_v10_close_message(pos, R, oc, exit_price))
-                logger.info("V10 KAPANDI %s %s %s R=%.2f", pos["side"], pos["symbol"], oc, R)
-            mp["open"] = still
+            B = 8
+            for i in range(0, len(acik), B):
+                grup = acik[i:i+B]
+                kl = await asyncio.gather(
+                    *[get_klines(p["symbol"], MA_KLINE_INTERVAL, 3) for p in grup],
+                    return_exceptions=True)
+                for pos, k in zip(grup, kl):
+                    if isinstance(k, Exception) or not k:
+                        still.append(pos); continue
+                    onceki = [bool(pos.get(f"hit{n}")) for n in (1, 2, 3, 4)]
+                    last = k[-1]
+                    R, oc = v10_check_paper(pos, closes(k)[-1],
+                                            safe_float(last[2]), safe_float(last[3]))
+                    if not oc:
+                        for n in (1, 2, 3):
+                            if pos.get(f"hit{n}") and not onceki[n-1]:
+                                lab_tp_isaretle(pos, n)
+                                await safe_send_telegram(build_lab_tp_message(pos, n))
+                        still.append(pos)
+                        continue
+                    if oc == "TP4":
+                        for n in (1, 2, 3, 4):
+                            if pos.get(f"hit{n}"):
+                                lab_tp_isaretle(pos, n)
+                    v10_record_closed(pos, R, oc)
+                    v130_kaydet_kapanis(pos, R, oc)
+                    lab_kapat(pos, R, oc)
+                    if oc == "STOP":
+                        v11_register_stop(pos["symbol"], pos["side"])   # V11 ceza kutusu
+                    if oc == "STOP":
+                        exit_price = pos["orig_stop"]
+                    elif oc == "TP4":
+                        exit_price = _lab_tp4(pos)
+                    elif oc == "TP3":
+                        exit_price = pos["tp3"]
+                    else:
+                        exit_price = pos["entry"]
+                    await safe_send_telegram(build_v10_close_message(pos, R, oc, exit_price))
+                    logger.info("LAB KAPANDI #%s %s %s %s R=%.2f",
+                                pos.get("sira"), pos["side"], pos["symbol"], oc, R)
+                await asyncio.sleep(0.2)
+            mp["open"] = still + [p for p in mp["open"] if id(p) not in islenen]
             adj = v10_learn_adjust()
             if adj:
                 await safe_send_telegram(f"🧠 V10 öğrenen: {adj}")
         except Exception as e:
             logger.exception("v10_paper_loop hata: %s", e)
-        await asyncio.sleep(max(60, int(MA_SCAN_INTERVAL_SEC)))
+        await asyncio.sleep(max(30, int(MA_SCAN_INTERVAL_SEC)))
 
 
 async def cmd_ws(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9200,7 +9534,8 @@ async def cmd_kazanan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                    ("g_skor","Skor eşiği"),("g_arastirma","Derin araştırma"),
                    ("g_1d","1D rejim"),("g_range","RANGE bloğu"),
                    ("g_choch","CHoCH sweep"),("g_volsok","Volatilite kalkanı"),
-                   ("g_drift","Fiyat kayması"),("g_tekrar","Tekrar kilidi")]
+                   ("g_drift","Fiyat kayması"),("g_tekrar","Tekrar kilidi"),
+                   ("g_4h","4H uyumu"),("g_fomo","FOMO kapısı")]
         alfa = 0.05 / max(1, len(kapilar))
         sonuc = []
         for kol, ad in kapilar:
@@ -9226,7 +9561,26 @@ async def cmd_kazanan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         L.append(f"(Bonferroni: {len(kapilar)} test → eşik p<{alfa:.4f})")
         L.append("✅ kapı İŞE YARIYOR | 🔴 kapı ZARAR VERİYOR | ⚪ fark yok, kapı gereksiz")
 
-        # 3) GİRİŞ TİPİ — retest beklemek işe yarıyor mu?
+        # 3) TP DAĞILIMI — "2000 kapanışta TP'lerin hepsine bakacağız"
+        L.append(f"\n━━ TP'YE ULAŞMA ORANLARI ━━")
+        try:
+            for i in (1, 2, 3, 4):
+                yz = {1: V11_TP1_PCT, 2: V11_TP2_PCT, 3: V11_TP3_PCT, 4: V11_TP4_PCT}[i]
+                h = con.execute(f"SELECT COUNT(*), AVG(r) FROM lab WHERE sonuc!='ACIK' "
+                                f"AND giris_tipi!='RASTGELE' AND hit{i}=1").fetchone()
+                hn, hev = int(safe_float(h[0])), safe_float(h[1])
+                L.append(f"TP{i} (%{yz:g}): {hn:,}/{sn:,} = %{(hn/sn*100 if sn else 0):.1f} "
+                         f"| bu işlemlerin EV'si {hev:+.3f}R")
+            mfe = con.execute("SELECT AVG(mfe_pct), MAX(mfe_pct), AVG(mae_pct) FROM lab "
+                              "WHERE sonuc!='ACIK' AND giris_tipi!='RASTGELE'").fetchone()
+            L.append(f"Ortalama en uzak lehe gidiş: +%{safe_float(mfe[0]):.2f} "
+                     f"(rekor +%{safe_float(mfe[1]):.2f}) | aleyhe -%{safe_float(mfe[2]):.2f}")
+            L.append("→ TP4'e ulaşma oranı düşük ama MFE ortalaması yüksekse hedef "
+                     "yanlış yerdedir, strateji değil.")
+        except Exception as e:
+            L.append(f"TP dağılımı hesaplanamadı: {e}")
+
+        # 4) GİRİŞ TİPİ — retest beklemek işe yarıyor mu?
         L.append(f"\n━━ GİRİŞ TİPİ ━━")
         for r in con.execute("SELECT giris_tipi, COUNT(*), "
                              "AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
@@ -9444,7 +9798,17 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ev = (sum(x["R"] for x in cl)/n) if n else 0
     wins = sum(1 for x in cl if x["R"] > 0)
     lines = [
-        f"🆕 V10 SMC durumu",
+        f"🆕 {VERSION_NAME}",
+        (f"🧪 TAM FİLTRESİZ MOD AÇIK — hiçbir kapı sinyal engellemiyor "
+         f"(eşikler duruyor, /esik ile bak)" if LAB_FILTRESIZ
+         else "Filtreler AKTİF (LAB_FILTRESIZ=false)"),
+        f"Sinyal Telegram'a: {'AÇIK' if LAB_TELEGRAM else 'KAPALI'} | "
+        f"Grafik: {'AÇIK' if LAB_GRAFIK else 'kapalı (düz metin)'} | Sıra no: "
+        f"{int(safe_float((memory.get('lab') or {}).get('sira')))}",
+        f"🎯 Hedefler: stop %{V11_STOP_PCT:g} | TP1 %{V11_TP1_PCT:g} | TP2 %{V11_TP2_PCT:g} | "
+        f"TP3 %{V11_TP3_PCT:g} | TP4 %{V11_TP4_PCT:g} (SON) | "
+        f"ağırlık {'/'.join(f'{x:g}' for x in LAB_TP_AGIRLIK)}",
+        f"TP1'de BE kapanış: {'AÇIK' if LAB_BE_KAPAT else 'KAPALI (pozisyon devam eder)'}",
         f"Motor: {'AÇIK' if V10_ENGINE_ENABLED else 'KAPALI'} | Min skor: {int(V10_MIN_QUALITY)}",
         f"Analiz: {stats.get('v10_analyzed',0)} | Aday: {stats.get('v10_candidates',0)} | Sinyal: {stats.get('v10_signals',0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
@@ -9518,9 +9882,90 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if mp["open"]:
         lines.append("— Açık —")
         for p in mp["open"][:10]:
-            tps = "".join("✅" if p[f"hit{i}"] else "▫️" for i in (1, 2, 3))
-            lines.append(f"{p['side']} {p['symbol']} {tps} R:{round(p['realized'],2)} skor {p['score']}")
+            tps = "".join("✅" if p.get(f"hit{i}") else "▫️" for i in (1, 2, 3, 4))
+            lines.append(f"#{int(safe_float(p.get('sira')))} {p['side']} {p['symbol']} {tps} "
+                         f"R:{round(safe_float(p.get('realized')),2)} "
+                         f"max+%{safe_float(p.get('mfe_pct')):.1f} skor {p['score']}")
     await update.message.reply_text("\n".join(lines))
+
+
+# ============================================================================ #
+#  LAB v2 — /TP1 /TP2 /TP3 /TP4 ve /ESIK KOMUTLARI
+#  "/TP1 yazınca TP1 gelen sinyallerin isimlerini verecek" mandatı.
+#  Kaynak SQLite: TP'ye değen her pozisyon ANINDA işaretlenir (kapanışı
+#  beklemez), böylece hâlâ AÇIK olan pozisyonlar da listede görünür.
+# ============================================================================ #
+def lab_tp_isaretle(pos: Dict[str, Any], n: int) -> None:
+    """TP'ye değildiği ANDA deftere yaz — /TPn listesi açık pozisyonu da görsün."""
+    con = lab_db()
+    rid = pos.get("lab_id")
+    if not con or not rid:
+        return
+    try:
+        con.execute(f"UPDATE lab SET hit{n}=1, mfe_pct=? WHERE id=?",
+                    (safe_float(pos.get("mfe_pct")), rid))
+        con.commit()
+    except Exception as e:
+        logger.debug("LAB tp işaret hatası: %s", e)
+
+
+async def _lab_tp_listesi(update: Update, n: int) -> None:
+    con = lab_db()
+    if not con:
+        await update.message.reply_text("🧪 LAB veritabanı yok (LAB_MODE=false?)")
+        return
+    yuzde = {1: V11_TP1_PCT, 2: V11_TP2_PCT, 3: V11_TP3_PCT, 4: V11_TP4_PCT}[n]
+    try:
+        top = int(safe_float(con.execute(
+            f"SELECT COUNT(*) FROM lab WHERE hit{n}=1").fetchone()[0]))
+        tum = int(safe_float(con.execute("SELECT COUNT(*) FROM lab").fetchone()[0]))
+        rows = con.execute(
+            f"SELECT sira,sembol,yon,skor,sonuc,r,acilis_ts,mfe_pct FROM lab "
+            f"WHERE hit{n}=1 ORDER BY acilis_ts DESC LIMIT 60").fetchall()
+    except Exception as e:
+        await update.message.reply_text(f"🧪 TP{n} sorgu hatası: {e}")
+        return
+
+    oran = (top / tum * 100.0) if tum else 0.0
+    L = [f"🎯 TP{n} (%{yuzde:g}) GELEN SİNYALLER",
+         f"Toplam: {top:,} / {tum:,} sinyal  (%{oran:.1f})", ""]
+    if not rows:
+        L.append("Henüz TP%d'e ulaşan sinyal yok." % n)
+        await update.message.reply_text("\n".join(L))
+        return
+    for r in rows:
+        sira, sem, yon, skor, sonuc, rr, ats, mfe = r
+        ad = str(sem or "").replace("-USDT-SWAP", "")
+        dur = "AÇIK" if str(sonuc) == "ACIK" else f"{str(sonuc)} {safe_float(rr):+.2f}R"
+        L.append(f"#{int(safe_float(sira))} {ad} {yon} | skor {safe_float(skor):.1f} | "
+                 f"{dur} | max +%{safe_float(mfe):.1f}")
+        L.append(f"     📅 {tr_str(safe_float(ats))}")
+    if top > len(rows):
+        L.append(f"\n… en yeni {len(rows)} tanesi gösterildi (toplam {top:,}).")
+    metin = "\n".join(L)
+    for i in range(0, len(metin), 3800):
+        await update.message.reply_text(metin[i:i+3800])
+
+
+async def cmd_tp1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _lab_tp_listesi(update, 1)
+
+
+async def cmd_tp2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _lab_tp_listesi(update, 2)
+
+
+async def cmd_tp3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _lab_tp_listesi(update, 3)
+
+
+async def cmd_tp4(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _lab_tp_listesi(update, 4)
+
+
+async def cmd_esik(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Filtreler ve eşikleri SİLİNMEDİ — kanıtı bu tablo."""
+    await update.message.reply_text(lab_esik_ozeti())
 
 
 # ============================================================================ #
@@ -9551,6 +9996,12 @@ def build_app():
     application.add_handler(CommandHandler("history", cmd_history))
     application.add_handler(CommandHandler("huni", cmd_huni))
     application.add_handler(CommandHandler("kazanan", cmd_kazanan))
+    # --- LAB v2 komutları (/TP1 büyük harfle de çalışır, Telegram küçültür) ---
+    application.add_handler(CommandHandler("tp1", cmd_tp1))
+    application.add_handler(CommandHandler("tp2", cmd_tp2))
+    application.add_handler(CommandHandler("tp3", cmd_tp3))
+    application.add_handler(CommandHandler("tp4", cmd_tp4))
+    application.add_handler(CommandHandler("esik", cmd_esik))
     return application
 
 def main() -> None:
