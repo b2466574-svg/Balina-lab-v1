@@ -5654,7 +5654,76 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Not: {f_signal.get('note', '-') or '-'}"
     )
 
+# ---------------------------------------------------------------------------
+#  V2.2: ARKA PLAN DÖNGÜ YÖNETİCİSİ
+#  Eski kod asyncio.create_task(...) çağırıp dönen Task'i ATIYORDU. CPython'da
+#  event loop task'lara sadece ZAYIF referans tutar; güçlü referans kalmazsa
+#  GC bir döngüyü çalışırken toplayabilir ve döngü SESSİZCE ölür — log'a hiçbir
+#  şey düşmez. "Bot ayakta ama LAB kayıt almıyor" tipi hayalet arızanın sebebi
+#  tam olarak budur. Artık her task set'te tutuluyor ve ölürse log'a yazıyor.
+# ---------------------------------------------------------------------------
+_ARKAPLAN_TASKS: set = set()
+
+
+def _task_bitti(task: "asyncio.Task") -> None:
+    _ARKAPLAN_TASKS.discard(task)
+    ad = "?"
+    try:
+        ad = task.get_name()
+    except Exception:
+        pass
+    if task.cancelled():
+        logger.info("Döngü iptal edildi: %s", ad)
+        return
+    hata = task.exception()
+    if hata is not None:
+        stats["olu_dongu"] = int(safe_float(stats.get("olu_dongu"))) + 1
+        stats["olu_dongu_ad"] = ad
+        logger.error("🔴 DÖNGÜ ÖLDÜ: %s", ad, exc_info=hata)
+    else:
+        logger.warning("Döngü kendiliğinden bitti: %s", ad)
+
+
+def _spawn(coro, ad: str) -> "asyncio.Task":
+    """Arka plan döngüsünü başlat, referansını TUT, ölürse haber ver."""
+    t = asyncio.create_task(coro, name=ad)
+    _ARKAPLAN_TASKS.add(t)
+    t.add_done_callback(_task_bitti)
+    return t
+
+
+def arkaplan_durumu() -> str:
+    """/status ve /ws için: hangi döngüler hâlâ hayatta?"""
+    canli = sorted(t.get_name() for t in _ARKAPLAN_TASKS if not t.done())
+    olu = int(safe_float(stats.get("olu_dongu")))
+    L = [f"Canlı döngü: {len(canli)}"]
+    if canli:
+        L.append("  " + ", ".join(canli))
+    if olu:
+        L.append(f"🔴 Ölen döngü: {olu} (son: {stats.get('olu_dongu_ad','?')})")
+    return "\n".join(L)
+
+
 async def post_init(application) -> None:
+    # V2.2: komut menüsünü Telegram'a bildir → uygulamada "/" yazınca liste çıkar
+    try:
+        from telegram import BotCommand
+        await application.bot.set_my_commands([
+            BotCommand("tp1",   "TP1 gelen sinyaller + CSV dosyası"),
+            BotCommand("tp2",   "TP2 gelen sinyaller + CSV dosyası"),
+            BotCommand("tp3",   "TP3 gelen sinyaller + CSV dosyası"),
+            BotCommand("tp4",   "TP4 gelen sinyaller + CSV dosyası"),
+            BotCommand("stop",  "STOP olan sinyaller + CSV dosyası"),
+            BotCommand("rapor", "TÜM defter — tek CSV"),
+            BotCommand("huni2", "Strateji vs rastgele kontrol grubu"),
+            BotCommand("status", "Bot durumu"),
+            BotCommand("v10",   "V10 motor detayı"),
+            BotCommand("esik",  "Filtreler ve eşikler"),
+            BotCommand("ws",    "Canlı WS katmanı teşhisi"),
+        ])
+    except Exception as e:
+        logger.debug("Komut menüsü ayarlanamadı: %s", e)
+
     active_count, pruned_count = await refresh_coin_pool(force=True)
 
     if AUTO_START_MESSAGE:
@@ -5681,25 +5750,25 @@ async def post_init(application) -> None:
             f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok"
         )
 
-    asyncio.create_task(hot_scan_loop())
-    asyncio.create_task(deep_scan_loop())
-    asyncio.create_task(symbol_refresh_loop())
-    asyncio.create_task(ma_long_scan_loop())
-    asyncio.create_task(ma_short_scan_loop())
-    asyncio.create_task(ma_followup_loop())
-    asyncio.create_task(heartbeat_loop())
-    asyncio.create_task(diagnostic_loop())
-    asyncio.create_task(followup_loop())
-    asyncio.create_task(save_loop())
+    _spawn(hot_scan_loop(),       "hot_scan")
+    _spawn(deep_scan_loop(),      "deep_scan")
+    _spawn(symbol_refresh_loop(), "symbol_refresh")
+    _spawn(ma_long_scan_loop(),   "ma_long")
+    _spawn(ma_short_scan_loop(),  "ma_short")
+    _spawn(ma_followup_loop(),    "ma_followup")
+    _spawn(heartbeat_loop(),      "heartbeat")
+    _spawn(diagnostic_loop(),     "diagnostic")
+    _spawn(followup_loop(),       "followup")
+    _spawn(save_loop(),           "save")
     v135_risk_bagla()                       # RiskGuard'ı kalıcı duruma bağla
-    asyncio.create_task(v135_saglik_loop())
+    _spawn(v135_saglik_loop(),    "saglik")
     if LAB_MODE:
         lab_db()
-        asyncio.create_task(lab_rastgele_loop())
-    asyncio.create_task(v10_scan_loop())
-    asyncio.create_task(v10_paper_loop())
+        _spawn(lab_rastgele_loop(), "lab_rastgele")
+    _spawn(v10_scan_loop(),       "v10_scan")
+    _spawn(v10_paper_loop(),      "v10_paper")
     if V12_WS_ENABLED:
-        asyncio.create_task(v12_ws_loop())
+        _spawn(v12_ws_loop(),     "v12_ws")
         if not _V12_WS_OK:
             await safe_send_telegram(
                 "⚠️ Canlı WS katmanı başlatılamadı: 'websockets' kütüphanesi yok.\n"
@@ -6229,6 +6298,11 @@ LAB_MODE             = os.getenv("LAB_MODE", "true").lower() == "true"
 LAB_DB_PATH          = os.getenv("LAB_DB_PATH", "/data/lab.db").strip()
 LAB_MAX_OPEN         = int(float(os.getenv("LAB_MAX_OPEN", "2000")))
 LAB_RANDOM_PCT       = float(os.getenv("LAB_RANDOM_PCT", "15"))   # rastgele kontrol oranı
+_LAB_BASLANGIC_TS    = time.time()      # V2.2: rastgele oranını hesaplamak için
+# V2.2: bir sinyalin "sonucu belli" sayılması için geçmesi gereken süre.
+# 10 dk önce açılmış sinyali TP oranı paydasına koymak oranı sistematik olarak
+# aşağı çeker. Rapor komutları bu süreden genç sinyalleri paydaya ALMAZ.
+LAB_OLGUNLASMA_SAAT  = float(os.getenv("LAB_OLGUNLASMA_SAAT", "24"))
 LAB_MILESTONE        = int(float(os.getenv("LAB_MILESTONE", "250")))
 LAB_TARGET_CLOSES    = int(float(os.getenv("LAB_TARGET_CLOSES", "2000")))
 LAB_MIN_CELL         = int(float(os.getenv("LAB_MIN_CELL", "100")))  # bu altındaki hücre yorumlanmaz
@@ -6276,7 +6350,12 @@ def lab_db():
         # eksik sütunlar eklenir. ALTER TABLE ADD COLUMN veriyi bozmaz.
         _yeni = {"sira":"INT", "tp4":"REAL", "hit4":"INT",
                  "mfe_pct":"REAL", "mae_pct":"REAL",
-                 "g_4h":"INT", "g_fomo":"INT"}
+                 "g_4h":"INT", "g_fomo":"INT",
+                 # V2.2: MFE'den türeyen ÖLÇÜM bayrakları. hit* R muhasebesidir
+                 # (stop öncelikli, muhafazakâr); dokundu* ise "fiyat o seviyeye
+                 # gerçekten değdi mi" sorusunun tarafsız cevabıdır.
+                 "dokundu1":"INT", "dokundu2":"INT",
+                 "dokundu3":"INT", "dokundu4":"INT"}
         try:
             _mevcut = {r[1] for r in con.execute("PRAGMA table_info(lab)")}
             for _c, _t in _yeni.items():
@@ -6368,10 +6447,13 @@ def lab_kapat(pos: Dict[str, Any], R: float, outcome: str) -> None:
     try:
         sure = (time.time() - safe_float(pos.get("open_ts"))) / 60.0
         con.execute("UPDATE lab SET kapanis_ts=?,sonuc=?,r=?,hit1=?,hit2=?,hit3=?,hit4=?,"
+                    "dokundu1=?,dokundu2=?,dokundu3=?,dokundu4=?,"
                     "mfe_pct=?,mae_pct=?,sure_dk=? WHERE id=?",
                     (time.time(), outcome, round(R, 3), int(bool(pos.get("hit1"))),
                      int(bool(pos.get("hit2"))), int(bool(pos.get("hit3"))),
                      int(bool(pos.get("hit4"))),
+                     int(bool(pos.get("dokundu1"))), int(bool(pos.get("dokundu2"))),
+                     int(bool(pos.get("dokundu3"))), int(bool(pos.get("dokundu4"))),
                      safe_float(pos.get("mfe_pct")), safe_float(pos.get("mae_pct")),
                      round(sure, 1), rid))
         con.commit()
@@ -7208,6 +7290,14 @@ V10_MAX_OPEN         = int(float(os.getenv("V10_MAX_OPEN_POSITIONS", "12")))
 V10_RISK_PCT         = float(os.getenv("V10_RISK_PCT", "1.5"))
 V10_LEARN_MIN_TRADES = int(float(os.getenv("V10_LEARN_MIN_TRADES", "30")))
 V10_LEARN_AUTO_ADJUST = os.getenv("V10_LEARN_AUTO_ADJUST", "false").lower() == "true"
+# --- V2.2: öğrenme mekanizmasının güvenlik kapıları -------------------------
+# Skorun sonuçla korelasyonu bu değerin altındaysa eşik OYNATILMAZ. Ölçülen
+# gerçek değer r = -0.008 idi; yani skor kalibre edilene kadar öğrenme
+# kendiliğinden duracak. 0.15 istatistikte "zayıf ama var" sınırıdır.
+V10_LEARN_MIN_KORELASYON = float(os.getenv("V10_LEARN_MIN_KORELASYON", "0.15"))
+V10_LEARN_MIN_KOVA   = int(float(os.getenv("V10_LEARN_MIN_KOVA", "15")))
+V10_MIN_QUALITY_TAVAN = float(os.getenv("V10_MIN_QUALITY_TAVAN", "80"))
+V10_MIN_QUALITY_TABAN = float(os.getenv("V10_MIN_QUALITY_TABAN", "50"))
 
 v10_last_alert: Dict[str, float] = {}
 v10_sent_candle: Dict[str, str] = {}
@@ -8969,7 +9059,20 @@ def build_v10_close_message(pos, R, outcome, exit_price):
     )
 
 def v10_score_band(s):
-    return "90-100" if s >= 90 else "80-90" if s >= 80 else "70-80" if s >= 70 else "60-70"
+    """V2.2 DÜZELTME: eski kod 60 ALTINDAKİ HER SKORU '60-70' kovasına atıyordu.
+    LAB_MODE'da skor eşiği engellemediği için skorların yaklaşık yarısı 60'ın
+    altında; hepsi tek kovada toplanınca hem /v10 öğrenme raporu hem de
+    v10_learn_adjust() bozuk veri okuyordu. Artık tüm aralık kapsanıyor."""
+    s = safe_float(s)
+    if s >= 90: return "90-100"
+    if s >= 80: return "80-90"
+    if s >= 70: return "70-80"
+    if s >= 60: return "60-70"
+    if s >= 50: return "50-60"
+    if s >= 40: return "40-50"
+    if s >= 30: return "30-40"
+    if s >  0:  return "<30"
+    return "RASTGELE"          # skor 0 = kontrol grubu, kendi kovasında dursun
 
 
 def _v10_mem():
@@ -8992,6 +9095,8 @@ def v10_open_paper(sig):
         "tp3_rr":safe_float(sig.get("tp3_rr"), V10_TP3_RR),
         "tp4_rr":safe_float(sig.get("tp4_rr"), 10.0),
         "hit1":False,"hit2":False,"hit3":False,"hit4":False,"realized":0.0,
+        # V2.2: MFE tabanlı ÖLÇÜM bayrakları (R muhasebesinden bağımsız)
+        "dokundu1":False,"dokundu2":False,"dokundu3":False,"dokundu4":False,
         # LAB v2: SIRA NO — sinyal mesajı ile TP/STOP mesajını birbirine bağlar
         "sira":int(safe_float(sig.get("sira"))),
         "acilis_saat":sig.get("acilis_saat") or tr_str(),
@@ -9051,6 +9156,22 @@ def v10_check_paper(pos, price, hi=None, lo=None):
         aleyh = ((e - lo) / e * 100.0) if up else ((hi - e) / e * 100.0)
         if lehe  > safe_float(pos.get("mfe_pct")): pos["mfe_pct"] = round(lehe, 3)
         if aleyh > safe_float(pos.get("mae_pct")): pos["mae_pct"] = round(aleyh, 3)
+
+    # --- V2.2: ÖLÇÜM BAYRAKLARI (dokundu mu?) -----------------------------
+    # Aşağıdaki hit1..hit4 bayrakları R MUHASEBESİ içindir ve stop önceliklidir:
+    # aynı pencerede hem TP hem stop görüldüyse TP kredisi verilmez (defter
+    # iyimser olmasın diye — bu doğru tercih, korunuyor).
+    #
+    # AMA bu, ÖLÇÜMÜ bozuyordu: fiyat gerçekten +%4'e değip sonra stopa dönen
+    # bir işlem "TP1'e hiç gitmedi" gibi görünüyordu. Poll aralığı 30sn, takip
+    # mumu 1m olduğu için bu senaryo nadir değil.
+    #
+    # Çözüm: MFE'den türeyen AYRI bir bayrak seti. Bunlar R'yi ETKİLEMEZ,
+    # sadece "sinyal doğru yönü buldu mu" sorusunu dürüstçe ölçer.
+    _mfe = safe_float(pos.get("mfe_pct"))
+    for _n, _yz in ((1, V11_TP1_PCT), (2, V11_TP2_PCT), (3, V11_TP3_PCT), (4, V11_TP4_PCT)):
+        if _mfe >= safe_float(_yz) and not pos.get(f"dokundu{_n}"):
+            pos[f"dokundu{_n}"] = True
 
     def _kalan():
         k = 1.0
@@ -9113,20 +9234,79 @@ def v10_learn_report():
     return out
 
 
+def v10_skor_korelasyon() -> Optional[Dict[str, Any]]:
+    """V2.2: skorun sonuçla korelasyonu (Pearson). Öğrenme mekanizmasının
+    çalışmaya HAKKI olup olmadığını buradan öğreniyoruz.
+
+    Ölçüm: |r| < V10_LEARN_MIN_KORELASYON ise skorun ayırt edici gücü yoktur;
+    o durumda eşik oynatmak gürültü kovalamaktır ve YAPILMAZ."""
+    mp = _v10_mem()
+    d = [(safe_float(c.get("score")), safe_float(c.get("R")))
+         for c in mp["closed"] if safe_float(c.get("score")) > 0]
+    n = len(d)
+    if n < 20:
+        return None
+    xs = [a for a, _ in d]; ys = [b for _, b in d]
+    mx = sum(xs)/n; my = sum(ys)/n
+    pay = sum((a-mx)*(b-my) for a, b in d)
+    vx = sum((a-mx)**2 for a in xs); vy = sum((b-my)**2 for b in ys)
+    payda = (vx*vy) ** 0.5
+    r = (pay/payda) if payda > 0 else 0.0
+    return {"n": n, "r": round(r, 4), "ort_skor": round(mx, 1), "ort_R": round(my, 3)}
+
+
 def v10_learn_adjust():
+    """V2.2 DÜZELTME — üç ayrı kusur giderildi:
+
+    1) TEK YÖNLÜYDÜ: eşik sadece artıyordu, hiç düşmüyordu. 85'e kadar tırmanıp
+       normal modda tüm sinyalleri keserdi. Artık iki yönlü çalışır.
+    2) GÜRÜLTÜ KOVALIYORDU: skorun sonuçla korelasyonu ölçülmeden eşik
+       oynatılıyordu. Ölçülen r = -0.008 (yani sıfır) iken eşiği yükseltmek
+       rastgele bir sayıyı takip etmektir. Artık önce korelasyon kapısı var.
+    3) BOZUK KOVA OKUYORDU: v10_score_band() 60 altını tek kovaya atıyordu;
+       o hata da düzeltildi.
+
+    Varsayılan olarak KAPALI (V10_LEARN_AUTO_ADJUST=false). Skor kalibre
+    edilene kadar açılmamalı."""
     global V10_MIN_QUALITY
     mp = _v10_mem()
     if not V10_LEARN_AUTO_ADJUST or len(mp["closed"]) < V10_LEARN_MIN_TRADES:
         return None
-    worst = None
+
+    kor = v10_skor_korelasyon()
+    if not kor:
+        return None
+    if abs(kor["r"]) < V10_LEARN_MIN_KORELASYON:
+        # Skorun ayırt edici gücü ölçülemedi → eşiğe DOKUNMA.
+        if not stats.get("v10_learn_uyari"):
+            stats["v10_learn_uyari"] = 1
+            logger.warning("V10 ÖĞRENME DURDURULDU: skor-sonuç korelasyonu r=%.3f "
+                           "(n=%d) → eşik oynatmak gürültü kovalamaktır.",
+                           kor["r"], kor["n"])
+            return (f"⏸ Öğrenme duraklatıldı: skor↔R korelasyonu r={kor['r']:+.3f} "
+                    f"(n={kor['n']}). Eşiğe dokunulmadı.")
+        return None
+
+    en_kotu = None; en_iyi = None
     for bk, b in mp["buckets"].items():
-        if b["n"] >= 10:
+        if b["n"] >= V10_LEARN_MIN_KOVA and not bk.endswith("RASTGELE"):
             ev = b["R"]/b["n"]
-            if ev < -0.1 and (worst is None or ev < worst[1]): worst = (bk, ev)
-    if worst and V10_MIN_QUALITY < 85:
-        V10_MIN_QUALITY += 2
-        logger.info("V10 ADAPTİF: %s EV=%.2f → min skor %d", worst[0], worst[1], int(V10_MIN_QUALITY))
-        return f"{worst[0]} kötü (EV {worst[1]:.2f}) → min skor {int(V10_MIN_QUALITY)}"
+            if ev < -0.1 and (en_kotu is None or ev < en_kotu[1]): en_kotu = (bk, ev)
+            if ev > +0.1 and (en_iyi is None or ev > en_iyi[1]):   en_iyi = (bk, ev)
+
+    onceki = V10_MIN_QUALITY
+    if en_kotu and V10_MIN_QUALITY < V10_MIN_QUALITY_TAVAN:
+        V10_MIN_QUALITY = min(V10_MIN_QUALITY_TAVAN, V10_MIN_QUALITY + 2)
+        logger.info("V10 ADAPTİF ↑: %s EV=%.2f → min skor %d",
+                    en_kotu[0], en_kotu[1], int(V10_MIN_QUALITY))
+        return (f"{en_kotu[0]} kötü (EV {en_kotu[1]:.2f}) → min skor "
+                f"{int(onceki)}→{int(V10_MIN_QUALITY)} [r={kor['r']:+.3f}]")
+    if en_iyi and not en_kotu and V10_MIN_QUALITY > V10_MIN_QUALITY_TABAN:
+        V10_MIN_QUALITY = max(V10_MIN_QUALITY_TABAN, V10_MIN_QUALITY - 2)
+        logger.info("V10 ADAPTİF ↓: %s EV=%.2f → min skor %d",
+                    en_iyi[0], en_iyi[1], int(V10_MIN_QUALITY))
+        return (f"{en_iyi[0]} iyi (EV {en_iyi[1]:.2f}) → min skor "
+                f"{int(onceki)}→{int(V10_MIN_QUALITY)} [r={kor['r']:+.3f}]")
     return None
 
 
@@ -9370,9 +9550,16 @@ async def lab_rastgele_loop() -> None:
                             stats["lab_rastgele"] = int(stats.get("lab_rastgele", 0)) + 1
         except Exception as e:
             logger.debug("LAB rastgele hata: %s", e)
-        # sinyal hızına oranlı: LAB_RANDOM_PCT kadar rastgele olsun
-        hiz = max(1, int(safe_float(stats.get("v10_signals"), 1)))
-        await asyncio.sleep(max(20.0, 600.0 * (15.0 / max(1.0, LAB_RANDOM_PCT))))
+        # V2.2 DÜZELTME: 'hiz' hesaplanıp KULLANILMADAN atılıyordu. Docstring
+        # "sinyal hızına oranlı" diyordu ama gerçek aralık sabit 10 dakikaydı
+        # (600 * 15/15). Sonuç: strateji yavaşlayınca kontrol grubu defterde
+        # orantısız yer kaplıyor, hızlanınca yetersiz kalıyordu. Artık gerçekten
+        # oranlı: saatlik strateji sinyali x LAB_RANDOM_PCT kadar rastgele üret.
+        gecen_saat = max(0.25, (time.time() - _LAB_BASLANGIC_TS) / 3600.0)
+        strateji_saatlik = safe_float(stats.get("v10_signals")) / gecen_saat
+        hedef_saatlik = max(0.05, strateji_saatlik * (LAB_RANDOM_PCT / 100.0))
+        bekle = 3600.0 / hedef_saatlik
+        await asyncio.sleep(float(clamp(bekle, 60.0, 7200.0)))
 
 
 async def v135_saglik_loop() -> None:
@@ -9465,7 +9652,12 @@ async def v10_paper_loop() -> None:
                         still.append(pos); continue
                     pos["son_kontrol_ts"] = time.time()
                     onceki = [bool(pos.get(f"hit{n}")) for n in (1, 2, 3, 4)]
+                    onceki_dok = [bool(pos.get(f"dokundu{n}")) for n in (1, 2, 3, 4)]
                     R, oc = v10_check_paper(pos, pen["fiyat"], pen["hi"], pen["lo"])
+                    # V2.2: ölçüm bayrağı değiştiyse deftere yaz. Pozisyon
+                    # kapansa da kapanmasa da — MFE tabanlı ölçüm R'den bağımsız.
+                    if [bool(pos.get(f"dokundu{n}")) for n in (1, 2, 3, 4)] != onceki_dok:
+                        lab_dokundu_isaretle(pos)
                     if pen["onceki_stop"] and oc != "STOP":
                         # Eski kod burada SAHTE STOP yazacaktı. Sayacı /v10'da.
                         stats["lab_sahte_stop_onlendi"] = int(
@@ -9941,6 +10133,7 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Balina Gözü: {'AÇIK' if V11_WHALE_EYE else 'KAPALI'} (veto={V11_WHALE_VETO})",
         f"Canlı WS: {'🟢 akıyor' if v12_health()['ok'] else ('🔴 veri yok' if _V12_WS_OK else '⛔ kütüphane yok')}"
         f" — detay için /ws",
+        arkaplan_durumu(),      # V2.2: ölen arka plan döngüsü var mı?
         f"Red sayaçları: tekrar={int(stats.get('v11_red_tekrar',0))} araştırma={int(stats.get('v11_red_arastirma',0))} "
         f"range={int(stats.get('v11_red_range',0))} choch={int(stats.get('v11_red_choch',0))} drift={int(stats.get('v11_red_drift',0))}",
     ]
@@ -9984,65 +10177,404 @@ def lab_tp_isaretle(pos: Dict[str, Any], n: int) -> None:
     if not con or not rid:
         return
     try:
-        con.execute(f"UPDATE lab SET hit{n}=1, mfe_pct=? WHERE id=?",
-                    (safe_float(pos.get("mfe_pct")), rid))
+        con.execute(f"UPDATE lab SET hit{n}=1, dokundu{n}=1, mfe_pct=?, mae_pct=? WHERE id=?",
+                    (safe_float(pos.get("mfe_pct")), safe_float(pos.get("mae_pct")), rid))
         con.commit()
     except Exception as e:
         logger.debug("LAB tp işaret hatası: %s", e)
 
 
-async def _lab_tp_listesi(update: Update, n: int) -> None:
+def lab_dokundu_isaretle(pos: Dict[str, Any]) -> None:
+    """V2.2: MFE tabanlı ÖLÇÜM bayraklarını canlı yaz.
+
+    hit* bayrağı stop-öncelikli olduğu için, aynı takip penceresinde hem TP'ye
+    hem stopa değen bir işlem TP kredisi ALMAZ (defter iyimser olmasın diye).
+    Bu doğru bir tercih ama ölçümü bozuyordu. dokundu* bayrağı R'yi hiç
+    etkilemeden 'fiyat o seviyeye gerçekten gitti mi' sorusunu cevaplar."""
+    con = lab_db()
+    rid = pos.get("lab_id")
+    if not con or not rid:
+        return
+    try:
+        con.execute("UPDATE lab SET dokundu1=?,dokundu2=?,dokundu3=?,dokundu4=?,"
+                    "mfe_pct=?,mae_pct=? WHERE id=?",
+                    (int(bool(pos.get("dokundu1"))), int(bool(pos.get("dokundu2"))),
+                     int(bool(pos.get("dokundu3"))), int(bool(pos.get("dokundu4"))),
+                     safe_float(pos.get("mfe_pct")), safe_float(pos.get("mae_pct")), rid))
+        con.commit()
+    except Exception as e:
+        logger.debug("LAB dokundu işaret hatası: %s", e)
+
+
+# ============================================================================ #
+#  V2.2 — DOSYA ÜRETEN RAPOR SİSTEMİ  (/tp1 /tp2 /tp3 /tp4 /stop /rapor)
+#
+#  ESKİ SİSTEMİN 3 KUSURU (hepsi burada giderildi):
+#
+#  1) PAYDA KİRLİYDİ. "SELECT COUNT(*) FROM lab" rastgele kontrol grubunu da
+#     sayıyordu. Rastgele sinyaller (giris_tipi='RASTGELE', skor=0, sira=0)
+#     yazı-turayla açılır; stratejinin başarısını ölçerken paydaya konmaz.
+#     Artık strateji ve rastgele AYRI raporlanıyor — asıl soru zaten
+#     "strateji rastgeleden iyi mi?" sorusudur.
+#
+#  2) OLGUNLAŞMAMIŞ SİNYALLER PAYDADAYDI. 10 dk önce açılmış bir sinyalin
+#     TP'ye gitmeye vakti olmaz ama paydada yer kaplar → oran sistematik
+#     olarak aşağı çıkar. Artık LAB_OLGUNLASMA_SAAT'ten genç sinyaller
+#     paydadan çıkarılıyor (ayrıca sayılıyor, gizlenmiyor).
+#
+#  3) SADECE 60 SATIR GÖSTERİLİYORDU. Artık TAMAMI CSV dosyası olarak
+#     gönderiliyor; sohbette sadece özet + en iyi/en yeni satırlar kalıyor.
+# ============================================================================ #
+
+LAB_RAPOR_SOHBET_SATIR = int(float(os.getenv("LAB_RAPOR_SOHBET_SATIR", "40")))
+
+# CSV başlıkları ve hangi kolondan geldikleri
+_LAB_CSV_KOLON = [
+    ("sira",        "sira"),
+    ("sembol",      "sembol"),
+    ("yon",         "yon"),
+    ("skor",        "skor"),
+    ("sonuc",       "sonuc"),
+    ("R",           "r"),
+    ("max_lehe_%",  "mfe_pct"),
+    ("max_aleyhe_%", "mae_pct"),
+    ("acilis",      "acilis_ts"),
+    ("kapanis",     "kapanis_ts"),
+    ("sure_dk",     "sure_dk"),
+    ("giris_tipi",  "giris_tipi"),
+    ("setup",       "setup"),
+    ("yapi_tipi",   "yapi_tipi"),
+    ("rsi",         "rsi"),
+    ("oi_%",        "oi"),
+    ("funding",     "funding"),
+    ("cvd",         "cvd"),
+    ("cvd_n",       "cvd_n"),
+    ("balina",      "balina"),
+    ("spoof",       "spoof"),
+    ("btc_1h",      "btc_1h"),
+    ("btc_4h",      "btc_4h"),
+    ("trend_1h",    "trend_1h"),
+    ("trend_4h",    "trend_4h"),
+    ("rejim_1d",    "rejim_1d"),
+    ("giris",       "giris"),
+    ("stop",        "stop"),
+    ("tp1",         "tp1"),
+    ("tp2",         "tp2"),
+    ("tp3",         "tp3"),
+    ("tp4",         "tp4"),
+    ("hit1",        "hit1"), ("hit2", "hit2"), ("hit3", "hit3"), ("hit4", "hit4"),
+    ("dokundu1", "dokundu1"), ("dokundu2", "dokundu2"),
+    ("dokundu3", "dokundu3"), ("dokundu4", "dokundu4"),
+    ("saat",        "saat"),
+    ("gun",         "gun"),
+    ("tum_kapilar_gecti", "g_hepsi"),
+]
+
+
+def _csv_hucre(v: Any, kolon: str) -> str:
+    """Excel dostu hücre. Türkçe locale virgülü ondalık ayırıcı sayar,
+    o yüzden ayraç NOKTALI VİRGÜL ve ondalık VİRGÜL kullanıyoruz."""
+    if v is None:
+        return ""
+    if kolon in ("acilis_ts", "kapanis_ts"):
+        t = safe_float(v)
+        return tr_str(t) if t > 0 else ""
+    if isinstance(v, float):
+        return f"{v:.6g}".replace(".", ",")
+    if isinstance(v, int):
+        return str(v)
+    s = str(v).replace(";", " ").replace("\n", " ").replace("\r", " ")
+    # Rakam gibi görünen metin varsa da ondalığı çevir
+    return s
+
+
+def _lab_csv_uret(rows: List[Any], kolon_adlari: List[str]) -> str:
+    idx = {ad: i for i, ad in enumerate(kolon_adlari)}
+    out = [";".join(b for b, k in _LAB_CSV_KOLON if k in idx)]
+    for r in rows:
+        hucreler = []
+        for _basluk, k in _LAB_CSV_KOLON:
+            if k not in idx:
+                continue
+            v = r[idx[k]]
+            if k == "sembol":
+                v = str(v or "").replace("-USDT-SWAP", "")
+            hucreler.append(_csv_hucre(v, k))
+        out.append(";".join(hucreler))
+    return "\n".join(out)
+
+
+async def _lab_dosya_gonder(update: Update, icerik: str, dosya_adi: str,
+                            aciklama: str = "") -> bool:
+    """CSV'yi Telegram'a BELGE olarak gönder. UTF-8 BOM ekleniyor ki Excel
+    Türkçe karakterleri doğru açsın."""
+    try:
+        from io import BytesIO
+        bio = BytesIO(("\ufeff" + icerik).encode("utf-8"))
+        bio.name = dosya_adi
+        await update.message.reply_document(document=bio, filename=dosya_adi,
+                                            caption=(aciklama or "")[:1024])
+        return True
+    except Exception as e:
+        logger.warning("LAB rapor dosyası gönderilemedi: %s", e)
+        try:
+            await update.message.reply_text(
+                f"⚠️ Dosya gönderilemedi ({e}). Özet yukarıda.")
+        except Exception:
+            pass
+        return False
+
+
+def _lab_olgun_kosul(alias: str = "") -> str:
+    """Olgunlaşma filtresi: bu süreden genç sinyal PAYDAYA girmez."""
+    p = (alias + ".") if alias else ""
+    sn = int(LAB_OLGUNLASMA_SAAT * 3600)
+    return f"({p}sonuc<>'ACIK' OR {p}acilis_ts <= {int(time.time()) - sn})"
+
+
+def _lab_oran_ozeti(con, kosul_sutun: str, etiket: str) -> Dict[str, Any]:
+    """Strateji ve rastgele için ayrı ayrı oran çıkarır. Asıl kanıt bu tablodur:
+    strateji oranı rastgele oranından anlamlı ölçüde YÜKSEK değilse edge yok."""
+    olgun = _lab_olgun_kosul()
+    cikti: Dict[str, Any] = {"etiket": etiket}
+    for ad, filt in (("strateji", "giris_tipi<>'RASTGELE'"),
+                     ("rastgele", "giris_tipi='RASTGELE'")):
+        try:
+            row = con.execute(
+                f"SELECT COUNT(*), SUM(CASE WHEN {kosul_sutun} THEN 1 ELSE 0 END), "
+                f"AVG(CASE WHEN sonuc<>'ACIK' THEN r END), "
+                f"SUM(CASE WHEN sonuc<>'ACIK' THEN 1 ELSE 0 END), "
+                f"AVG(mfe_pct), AVG(mae_pct) "
+                f"FROM lab WHERE {filt} AND {olgun}").fetchone()
+            n = int(safe_float(row[0])); h = int(safe_float(row[1]))
+            cikti[ad] = {"n": n, "hit": h,
+                         "oran": (h / n * 100.0) if n else 0.0,
+                         "ev": safe_float(row[2]),
+                         "kapanan": int(safe_float(row[3])),
+                         "mfe": safe_float(row[4]), "mae": safe_float(row[5])}
+        except Exception as e:
+            logger.debug("LAB oran özeti hatası (%s): %s", ad, e)
+            cikti[ad] = {"n": 0, "hit": 0, "oran": 0.0, "ev": 0.0,
+                         "kapanan": 0, "mfe": 0.0, "mae": 0.0}
+    return cikti
+
+
+def _lab_skor_bant_tablo(con, kosul_sutun: str) -> List[str]:
+    """Skor bandı x isabet oranı. Monoton artmıyorsa skor ayırt etmiyordur."""
+    olgun = _lab_olgun_kosul()
+    L = []
+    try:
+        rows = con.execute(
+            f"SELECT CASE WHEN skor<45 THEN '<45' WHEN skor<55 THEN '45-55' "
+            f"WHEN skor<65 THEN '55-65' WHEN skor<75 THEN '65-75' ELSE '75+' END AS bant, "
+            f"COUNT(*), SUM(CASE WHEN {kosul_sutun} THEN 1 ELSE 0 END), "
+            f"AVG(CASE WHEN sonuc<>'ACIK' THEN r END) "
+            f"FROM lab WHERE giris_tipi<>'RASTGELE' AND skor>0 AND {olgun} "
+            f"GROUP BY bant ORDER BY MIN(skor)").fetchall()
+        for bant, n, h, ev in rows:
+            n = int(safe_float(n)); h = int(safe_float(h))
+            if n < 3:
+                continue
+            L.append(f"  {str(bant):<6} n={n:<4} isabet %{(h/n*100 if n else 0):<5.1f} "
+                     f"EV {safe_float(ev):+.2f}R")
+    except Exception as e:
+        logger.debug("LAB skor bant hatası: %s", e)
+    return L
+
+
+async def _lab_rapor(update: Update, tur: str) -> None:
+    """tur: 'tp1'|'tp2'|'tp3'|'tp4'|'stop'|'hepsi'
+
+    Sohbete ÖZET + en iyi satırlar, dosyaya TAMAMI gider.
+    """
     con = lab_db()
     if not con:
         await update.message.reply_text("🧪 LAB veritabanı yok (LAB_MODE=false?)")
         return
-    yuzde = {1: V11_TP1_PCT, 2: V11_TP2_PCT, 3: V11_TP3_PCT, 4: V11_TP4_PCT}[n]
+
+    if tur == "stop":
+        kosul   = "sonuc='STOP'"
+        kosul_o = "sonuc='STOP'"
+        baslik  = "🛑 STOP OLAN SİNYALLER"
+        yuzde_s = f"stop %{V11_STOP_PCT:g}"
+        sirala  = "acilis_ts DESC"
+    elif tur == "hepsi":
+        kosul   = "1=1"
+        kosul_o = "1=1"
+        baslik  = "📒 TÜM SİNYALLER"
+        yuzde_s = "tam defter"
+        sirala  = "acilis_ts DESC"
+    else:
+        n = int(tur[-1])
+        yuzde = {1: V11_TP1_PCT, 2: V11_TP2_PCT, 3: V11_TP3_PCT, 4: V11_TP4_PCT}[n]
+        # V2.2: 'dokundu' ÖLÇÜM bayrağı esas alınır. hit* stop-öncelikli
+        # olduğu için aynı pencerede TP+stop görülen işlemi saymıyordu.
+        kosul   = f"(hit{n}=1 OR dokundu{n}=1)"
+        kosul_o = kosul
+        baslik  = f"🎯 TP{n} (%{yuzde:g}) GELEN SİNYALLER"
+        yuzde_s = f"TP{n} = %{yuzde:g}"
+        sirala  = "acilis_ts DESC"
+
+    # --- veriyi çek (TAMAMI, limit yok) -----------------------------------
+    kolonlar = [k for _b, k in _LAB_CSV_KOLON]
     try:
-        top = int(safe_float(con.execute(
-            f"SELECT COUNT(*) FROM lab WHERE hit{n}=1").fetchone()[0]))
-        tum = int(safe_float(con.execute("SELECT COUNT(*) FROM lab").fetchone()[0]))
+        _mevcut = {r[1] for r in con.execute("PRAGMA table_info(lab)")}
+        kolonlar = [k for k in kolonlar if k in _mevcut]
         rows = con.execute(
-            f"SELECT sira,sembol,yon,skor,sonuc,r,acilis_ts,mfe_pct FROM lab "
-            f"WHERE hit{n}=1 ORDER BY acilis_ts DESC LIMIT 60").fetchall()
+            f"SELECT {','.join(kolonlar)} FROM lab WHERE {kosul} ORDER BY {sirala}"
+        ).fetchall()
+        ozet = _lab_oran_ozeti(con, kosul_o, baslik)
+        ham_gec = int(safe_float(con.execute("SELECT COUNT(*) FROM lab").fetchone()[0]))
+        genc = int(safe_float(con.execute(
+            f"SELECT COUNT(*) FROM lab WHERE NOT {_lab_olgun_kosul()}").fetchone()[0]))
     except Exception as e:
-        await update.message.reply_text(f"🧪 TP{n} sorgu hatası: {e}")
+        await update.message.reply_text(f"🧪 Sorgu hatası: {e}")
         return
 
-    oran = (top / tum * 100.0) if tum else 0.0
-    L = [f"🎯 TP{n} (%{yuzde:g}) GELEN SİNYALLER",
-         f"Toplam: {top:,} / {tum:,} sinyal  (%{oran:.1f})", ""]
     if not rows:
-        L.append("Henüz TP%d'e ulaşan sinyal yok." % n)
-        await update.message.reply_text("\n".join(L))
+        await update.message.reply_text(f"{baslik}\nHenüz kayıt yok.")
         return
-    for r in rows:
-        sira, sem, yon, skor, sonuc, rr, ats, mfe = r
-        ad = str(sem or "").replace("-USDT-SWAP", "")
-        dur = "AÇIK" if str(sonuc) == "ACIK" else f"{str(sonuc)} {safe_float(rr):+.2f}R"
-        L.append(f"#{int(safe_float(sira))} {ad} {yon} | skor {safe_float(skor):.1f} | "
-                 f"{dur} | max +%{safe_float(mfe):.1f}")
-        L.append(f"     📅 {tr_str(safe_float(ats))}")
-    if top > len(rows):
-        L.append(f"\n… en yeni {len(rows)} tanesi gösterildi (toplam {top:,}).")
+
+    s = ozet["strateji"]; ra = ozet["rastgele"]
+    fark = s["oran"] - ra["oran"]
+    ev_fark = s["ev"] - ra["ev"]
+
+    L = [baslik, f"({yuzde_s})", ""]
+    L.append("📊 STRATEJİ  (rastgele kontrol grubu HARİÇ)")
+    L.append(f"   {s['hit']:,} / {s['n']:,} olgun sinyal  →  %{s['oran']:.1f}")
+    if s["kapanan"]:
+        L.append(f"   Kapanan {s['kapanan']:,} işlem · EV {s['ev']:+.3f}R")
+        L.append(f"   Ort. max lehe %{s['mfe']:.2f} · max aleyhe %{s['mae']:.2f}")
+    L.append("")
+    L.append("🎲 RASTGELE KONTROL  (yazı-tura)")
+    if ra["n"] >= 5:
+        L.append(f"   {ra['hit']:,} / {ra['n']:,}  →  %{ra['oran']:.1f}"
+                 + (f" · EV {ra['ev']:+.3f}R" if ra["kapanan"] else ""))
+        L.append("")
+        isaret = "✅" if fark > 5 else ("⚠️" if fark > -5 else "🔴")
+        L.append(f"{isaret} FARK: %{fark:+.1f} isabet"
+                 + (f" · {ev_fark:+.3f}R EV" if (s['kapanan'] and ra['kapanan']) else ""))
+        if abs(fark) < 5:
+            L.append("   → Strateji rastgeleden ayrışmıyor. EDGE YOK.")
+    else:
+        L.append(f"   n={ra['n']} — kıyas için yetersiz (en az 5 gerekir)")
+    L.append("")
+
+    if genc:
+        L.append(f"⏳ Paydaya alınmayan genç sinyal: {genc:,} "
+                 f"(< {LAB_OLGUNLASMA_SAAT:g} saat)")
+    L.append(f"📁 Ham defter: {ham_gec:,} kayıt · dosyada {len(rows):,} satır")
+    L.append("")
+
+    bant = _lab_skor_bant_tablo(con, kosul_o)
+    if bant:
+        L.append("🔢 SKOR BANDI (monoton artmalı — artmıyorsa skor ayırt etmiyor)")
+        L.extend(bant)
+        L.append("")
+
+    idx = {ad: i for i, ad in enumerate(kolonlar)}
+    L.append(f"📋 EN YENİ {min(LAB_RAPOR_SOHBET_SATIR, len(rows))} SATIR "
+             f"(tamamı ekteki dosyada)")
+    for r in rows[:LAB_RAPOR_SOHBET_SATIR]:
+        def g(k, d=""):
+            return r[idx[k]] if k in idx else d
+        ad = str(g("sembol") or "").replace("-USDT-SWAP", "")
+        sk = safe_float(g("skor"))
+        sn = str(g("sonuc") or "")
+        rr = safe_float(g("r"))
+        dur = "AÇIK" if sn == "ACIK" else f"{sn} {rr:+.2f}R"
+        tip = "🎲" if str(g("giris_tipi")) == "RASTGELE" else ""
+        L.append(f"#{int(safe_float(g('sira')))} {tip}{ad} {g('yon')} | "
+                 f"skor {sk:.1f} | {dur} | max +%{safe_float(g('mfe_pct')):.1f}")
+        L.append(f"     📅 {tr_str(safe_float(g('acilis_ts')))}")
+
     metin = "\n".join(L)
     for i in range(0, len(metin), 3800):
         await update.message.reply_text(metin[i:i+3800])
 
+    # --- CSV dosyası -------------------------------------------------------
+    csv_str = _lab_csv_uret(rows, kolonlar)
+    damga = tr_now().strftime("%Y%m%d_%H%M")
+    dosya = f"lab_{tur}_{damga}.csv"
+    await _lab_dosya_gonder(
+        update, csv_str, dosya,
+        f"{baslik} — {len(rows):,} satır · Excel'de aç (ayraç: noktalı virgül)")
+
 
 async def cmd_tp1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _lab_tp_listesi(update, 1)
+    await _lab_rapor(update, "tp1")
 
 
 async def cmd_tp2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _lab_tp_listesi(update, 2)
+    await _lab_rapor(update, "tp2")
 
 
 async def cmd_tp3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _lab_tp_listesi(update, 3)
+    await _lab_rapor(update, "tp3")
 
 
 async def cmd_tp4(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _lab_tp_listesi(update, 4)
+    await _lab_rapor(update, "tp4")
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _lab_rapor(update, "stop")
+
+
+async def cmd_rapor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tüm defteri tek CSV olarak ver — kendi analizini yapmak için."""
+    await _lab_rapor(update, "hepsi")
+
+
+async def cmd_huni2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """V2.2 HUNİ: strateji vs rastgele, her seviye için yan yana.
+    Tek bakışta 'edge var mı' sorusunu cevaplar."""
+    con = lab_db()
+    if not con:
+        await update.message.reply_text("🧪 LAB veritabanı yok (LAB_MODE=false?)")
+        return
+    L = ["🔻 HUNİ — STRATEJİ vs RASTGELE", ""]
+    L.append(f"{'seviye':<8}{'strateji':>12}{'rastgele':>12}{'fark':>9}")
+    L.append("-" * 41)
+    seviyeler = [("TP1", "(hit1=1 OR dokundu1=1)", V11_TP1_PCT),
+                 ("TP2", "(hit2=1 OR dokundu2=1)", V11_TP2_PCT),
+                 ("TP3", "(hit3=1 OR dokundu3=1)", V11_TP3_PCT),
+                 ("TP4", "(hit4=1 OR dokundu4=1)", V11_TP4_PCT),
+                 ("STOP", "sonuc='STOP'", V11_STOP_PCT)]
+    for ad, kosul, yz in seviyeler:
+        o = _lab_oran_ozeti(con, kosul, ad)
+        s = o["strateji"]; ra = o["rastgele"]
+        f = s["oran"] - ra["oran"]
+        L.append(f"{ad+' %'+f'{yz:g}':<8}{s['hit']:>5}/{s['n']:<5} "
+                 f"{ra['hit']:>4}/{ra['n']:<5} {f:>+8.1f}")
+    L.append("")
+    try:
+        row = con.execute(
+            f"SELECT COUNT(*), AVG(r), "
+            f"AVG(skor*r)-AVG(skor)*AVG(r), "
+            f"AVG(skor*skor)-AVG(skor)*AVG(skor), "
+            f"AVG(r*r)-AVG(r)*AVG(r) "
+            f"FROM lab WHERE sonuc<>'ACIK' AND giris_tipi<>'RASTGELE' AND skor>0"
+        ).fetchone()
+        n = int(safe_float(row[0]))
+        if n >= 20:
+            kov = safe_float(row[2]); vx = safe_float(row[3]); vy = safe_float(row[4])
+            r_p = kov / ((vx * vy) ** 0.5) if vx > 0 and vy > 0 else 0.0
+            L.append(f"📐 Skor↔R korelasyonu: r = {r_p:+.3f}  (n={n})")
+            if abs(r_p) < 0.15:
+                L.append("   → Skorun ayırt edici gücü YOK. Eşik oynatma anlamsız.")
+            else:
+                L.append(f"   → Skor sonucun ~%{r_p*r_p*100:.1f}'ini açıklıyor.")
+        else:
+            L.append(f"📐 Korelasyon için yetersiz örneklem (kapanan n={n}, gerekli 20)")
+        # Gereken örneklem
+        if n >= 10:
+            vy = safe_float(row[4])
+            gerek = int(vy / (0.1 * 0.1)) if vy > 0 else 0
+            L.append(f"🎯 ±0.1R hassasiyet için gereken kapanmış işlem: ~{gerek:,}")
+    except Exception as e:
+        logger.debug("huni2 korelasyon hatası: %s", e)
+    await update.message.reply_text("\n".join(L))
 
 
 async def cmd_esik(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10084,6 +10616,10 @@ def build_app():
     application.add_handler(CommandHandler("tp3", cmd_tp3))
     application.add_handler(CommandHandler("tp4", cmd_tp4))
     application.add_handler(CommandHandler("esik", cmd_esik))
+    # --- V2.2: dosya üreten rapor komutları ---------------------------------
+    application.add_handler(CommandHandler("stop", cmd_stop))     # STOP olanlar
+    application.add_handler(CommandHandler("rapor", cmd_rapor))   # tüm defter
+    application.add_handler(CommandHandler("huni2", cmd_huni2))   # strateji vs rastgele
     return application
 
 def main() -> None:
