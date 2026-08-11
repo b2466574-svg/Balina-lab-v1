@@ -5716,6 +5716,7 @@ async def post_init(application) -> None:
             BotCommand("stop",  "STOP olan sinyaller + CSV dosyası"),
             BotCommand("rapor", "TÜM defter — tek CSV"),
             BotCommand("huni2", "Strateji vs rastgele kontrol grubu"),
+            BotCommand("mfe_tamir", "Donmuş MFE verisini onar (bir kez çalıştır)"),
             BotCommand("status", "Bot durumu"),
             BotCommand("v10",   "V10 motor detayı"),
             BotCommand("esik",  "Filtreler ve eşikler"),
@@ -7438,6 +7439,30 @@ def lab_takip_bar_sayisi(pos: Dict[str, Any]) -> int:
         return LAB_TAKIP_LIMIT
     gerek = ((time.time() - basla) / 60.0) / max(1, bar_dk) + 5
     return int(max(LAB_TAKIP_LIMIT, min(300, gerek)))
+
+
+def lab_takip_plani(pos: Dict[str, Any]) -> Tuple[str, int]:
+    """V2.3: (zaman_dilimi, bar_sayisi) döndürür.
+
+    NEDEN: OKX candles ucu en fazla 300 mum verir. LAB_TAKIP_TF=1m ile bu
+    5 SAATLİK bir pencere demektir. Bot 5 saatten uzun kapalı kalırsa (deploy,
+    çökme, Railway uykusu) aradaki fiyat hareketi TAMAMEN görülmez — o sürede
+    stop yenmiş ya da TP geçilmiş olsa bile defter bilmez.
+
+    ÇÖZÜM: gereken pencere 300 barı aşıyorsa daha KABA bir zaman dilimine
+    geçilir. 1m yerine 5m/15m/1H kullanmak fitil çözünürlüğünü düşürür ama
+    'hiç görmemekten' kat kat iyidir. Boşluk kapandıktan sonra otomatik
+    olarak 1m'ye geri dönülür."""
+    basla = safe_float(pos.get("son_kontrol_ts")) or safe_float(pos.get("open_ts"))
+    if basla <= 0:
+        return LAB_TAKIP_TF, LAB_TAKIP_LIMIT
+    bosluk_dk = max(0.0, (time.time() - basla) / 60.0)
+    for tf in (LAB_TAKIP_TF, "5m", "15m", "1H", "4H"):
+        bar_dk = _TF_DAKIKA.get(tf, 1)
+        gerek = int(bosluk_dk / max(1, bar_dk)) + 5
+        if gerek <= 300:
+            return tf, int(max(LAB_TAKIP_LIMIT, min(300, gerek)))
+    return "4H", 300
 
 
 def lab_takip_penceresi(k: List[List[Any]], pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -9638,9 +9663,10 @@ async def v10_paper_loop() -> None:
             B = 8
             for i in range(0, len(acik), B):
                 grup = acik[i:i+B]
+                planlar = [lab_takip_plani(p) for p in grup]
                 kl = await asyncio.gather(
-                    *[get_klines(p["symbol"], LAB_TAKIP_TF, lab_takip_bar_sayisi(p))
-                      for p in grup],
+                    *[get_klines(p["symbol"], tf, lim)
+                      for p, (tf, lim) in zip(grup, planlar)],
                     return_exceptions=True)
                 for pos, k in zip(grup, kl):
                     if isinstance(k, Exception) or not k:
@@ -9690,6 +9716,12 @@ async def v10_paper_loop() -> None:
                     logger.info("LAB KAPANDI #%s %s %s %s R=%.2f",
                                 pos.get("sira"), pos["side"], pos["symbol"], oc, R)
                 await asyncio.sleep(0.2)
+            # V2.3: açık pozisyonların MFE/MAE'sini deftere TOPLU yaz.
+            # Bu satır olmadan MFE, son geçilen TP'nin üstünde donuyordu.
+            try:
+                lab_canli_guncelle(still)
+            except Exception as e:
+                logger.debug("LAB canlı yazım hatası: %s", e)
             mp["open"] = still + [p for p in mp["open"] if id(p) not in islenen]
             adj = v10_learn_adjust()
             if adj:
@@ -10184,6 +10216,56 @@ def lab_tp_isaretle(pos: Dict[str, Any], n: int) -> None:
         logger.debug("LAB tp işaret hatası: %s", e)
 
 
+def lab_canli_guncelle(pozlar: List[Dict[str, Any]]) -> int:
+    """V2.3 KRİTİK DÜZELTME — DONMUŞ MFE.
+
+    HATA: mfe_pct veritabanına SADECE iki anda yazılıyordu →
+      (a) bir TP'ye değildiği an (lab_tp_isaretle),
+      (b) pozisyon kapandığı an (lab_kapat).
+    Arada MFE bellekte büyümeye devam ediyor ama DEFTERE YAZILMIYORDU.
+
+    SONUÇ: açık bir pozisyonun DB'deki MFE'si, "en son geçtiği TP'nin hemen
+    üstünde" donuyordu. Canlı defterde ölçüldü: açık pozisyonların %63'ünün
+    MFE'si tam %4.00–%4.50 aralığındaydı (TP1 = %4). Yani "max +%4.1" yazan
+    bir sinyal gerçekte %15'e gitmiş olabilir.
+
+    ETKİSİ: MFE tabanlı HER analiz yanlış tabandaydı — stop mesafesi seçimi,
+    TP kalibrasyonu, "sinyal nereye kadar giderdi" sorusu, hepsi.
+
+    ÇÖZÜM: açık pozisyonların MFE/MAE'si her takip turunda toplu yazılır.
+    Tek transaction + executemany → 60 pozisyon için tek disk yazımı.
+    Sadece DEĞİŞEN kayıtlar gönderilir; değişmeyen pozisyon DB'ye dokunmaz."""
+    con = lab_db()
+    if not con:
+        return 0
+    veri = []
+    for p in pozlar:
+        rid = p.get("lab_id")
+        if not rid:
+            continue
+        mfe = safe_float(p.get("mfe_pct")); mae = safe_float(p.get("mae_pct"))
+        # sadece deftere yazılandan farklıysa gönder
+        if (abs(mfe - safe_float(p.get("_db_mfe"))) < 0.005 and
+                abs(mae - safe_float(p.get("_db_mae"))) < 0.005):
+            continue
+        veri.append((mfe, mae,
+                     int(bool(p.get("dokundu1"))), int(bool(p.get("dokundu2"))),
+                     int(bool(p.get("dokundu3"))), int(bool(p.get("dokundu4"))),
+                     rid))
+        p["_db_mfe"] = mfe; p["_db_mae"] = mae
+    if not veri:
+        return 0
+    try:
+        con.executemany("UPDATE lab SET mfe_pct=?,mae_pct=?,"
+                        "dokundu1=?,dokundu2=?,dokundu3=?,dokundu4=? WHERE id=?", veri)
+        con.commit()
+        stats["lab_canli_yazim"] = int(safe_float(stats.get("lab_canli_yazim"))) + len(veri)
+        return len(veri)
+    except Exception as e:
+        logger.debug("LAB canlı güncelleme hatası: %s", e)
+        return 0
+
+
 def lab_dokundu_isaretle(pos: Dict[str, Any]) -> None:
     """V2.2: MFE tabanlı ÖLÇÜM bayraklarını canlı yaz.
 
@@ -10577,6 +10659,97 @@ async def cmd_huni2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(L))
 
 
+async def cmd_mfe_tamir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """V2.3: MEVCUT BOZUK MFE VERİSİNİ ONAR.
+
+    v2.2'ye kadar açık pozisyonların MFE'si deftere sadece TP anında
+    yazılıyordu → değerler 'son geçilen TP'nin hemen üstünde' donmuştu.
+    Bu komut her açık pozisyon için GİRİŞTEN BUGÜNE tüm mumları çekip
+    MFE/MAE'yi sıfırdan hesaplar ve deftere yazar.
+
+    Yalnızca ölçüm verisini düzeltir; R muhasebesine, hit* bayraklarına ya da
+    pozisyonun açık/kapalı durumuna DOKUNMAZ."""
+    mp = _v10_mem()
+    acik = list(mp.get("open", []))
+    if not acik:
+        await update.message.reply_text("🔧 Açık pozisyon yok, onarılacak bir şey yok.")
+        return
+    await update.message.reply_text(
+        f"🔧 MFE onarımı başlıyor — {len(acik)} açık pozisyon.\n"
+        f"Girişten bugüne tüm mumlar yeniden okunacak, biraz sürebilir…")
+
+    duzelen = 0; toplam_fark = 0.0; hata = 0
+    en_buyuk: List[Tuple[float, str]] = []
+    B = 6
+    for i in range(0, len(acik), B):
+        grup = acik[i:i+B]
+        planlar = []
+        for p in grup:
+            sahte = {"son_kontrol_ts": safe_float(p.get("open_ts")),
+                     "open_ts": safe_float(p.get("open_ts"))}
+            planlar.append(lab_takip_plani(sahte))
+        kl = await asyncio.gather(
+            *[get_klines(p["symbol"], tf, lim) for p, (tf, lim) in zip(grup, planlar)],
+            return_exceptions=True)
+        for pos, k in zip(grup, kl):
+            if isinstance(k, Exception) or not k:
+                hata += 1
+                continue
+            try:
+                e = safe_float(pos.get("entry"))
+                if e <= 0:
+                    continue
+                acilis_ms = safe_float(pos.get("open_ts")) * 1000.0
+                sonra = [r for r in k if safe_float(r[0]) >= acilis_ms]
+                if not sonra:
+                    continue
+                hi = max(safe_float(r[2]) for r in sonra)
+                lo = min(safe_float(r[3]) for r in sonra)
+                up = pos.get("side") == "LONG"
+                yeni_mfe = ((hi - e) / e * 100.0) if up else ((e - lo) / e * 100.0)
+                yeni_mae = ((e - lo) / e * 100.0) if up else ((hi - e) / e * 100.0)
+                eski = safe_float(pos.get("mfe_pct"))
+                if yeni_mfe > eski + 0.01:
+                    fark = yeni_mfe - eski
+                    toplam_fark += fark
+                    duzelen += 1
+                    en_buyuk.append((fark, f"{pos['symbol'].replace('-USDT-SWAP','')} "
+                                           f"%{eski:.1f}→%{yeni_mfe:.1f}"))
+                    pos["mfe_pct"] = round(yeni_mfe, 3)
+                if yeni_mae > safe_float(pos.get("mae_pct")):
+                    pos["mae_pct"] = round(yeni_mae, 3)
+                # onarılan MFE'ye göre dokundu bayraklarını da tazele
+                for _n, _yz in ((1, V11_TP1_PCT), (2, V11_TP2_PCT),
+                                (3, V11_TP3_PCT), (4, V11_TP4_PCT)):
+                    if safe_float(pos.get("mfe_pct")) >= safe_float(_yz):
+                        pos[f"dokundu{_n}"] = True
+                pos["_db_mfe"] = None      # yazımı zorla
+            except Exception as ex:
+                hata += 1
+                logger.debug("MFE onarım hatası %s: %s", pos.get("symbol"), ex)
+        await asyncio.sleep(0.3)
+
+    yazilan = lab_canli_guncelle(acik)
+    en_buyuk.sort(reverse=True)
+    L = ["🔧 MFE ONARIMI TAMAMLANDI", "",
+         f"İncelenen açık pozisyon : {len(acik)}",
+         f"MFE'si düzeltilen       : {duzelen}",
+         f"Deftere yazılan         : {yazilan}",
+         f"Veri alınamayan         : {hata}"]
+    if duzelen:
+        L.append(f"Ortalama düzeltme       : +%{toplam_fark/duzelen:.2f}")
+        L.append("")
+        L.append("En büyük düzeltmeler:")
+        for f, ad in en_buyuk[:12]:
+            L.append(f"  +%{f:.1f}  {ad}")
+        L.append("")
+        L.append("Artık /tp1 /stop /rapor gerçek MFE'yi gösterir.")
+    else:
+        L.append("")
+        L.append("Düzeltme gerekmedi — defter zaten güncel.")
+    await update.message.reply_text("\n".join(L))
+
+
 async def cmd_esik(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Filtreler ve eşikleri SİLİNMEDİ — kanıtı bu tablo."""
     await update.message.reply_text(lab_esik_ozeti())
@@ -10620,6 +10793,7 @@ def build_app():
     application.add_handler(CommandHandler("stop", cmd_stop))     # STOP olanlar
     application.add_handler(CommandHandler("rapor", cmd_rapor))   # tüm defter
     application.add_handler(CommandHandler("huni2", cmd_huni2))   # strateji vs rastgele
+    application.add_handler(CommandHandler("mfe_tamir", cmd_mfe_tamir))  # V2.3 onarım
     return application
 
 def main() -> None:
