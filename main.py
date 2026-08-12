@@ -10474,6 +10474,10 @@ async def _lab_rapor(update: Update, tur: str) -> None:
         await update.message.reply_text("🧪 LAB veritabanı yok (LAB_MODE=false?)")
         return
 
+    # V2.4 DÜZELTME: tur="hepsi" için "isabet" kavramı yoktu; kosul="1=1"
+    # olduğu için her satır "isabet" sayılıyor ve rapor "180/180 = %100"
+    # gösteriyordu. Anlamsız bir satırdı. Artık tam defter için TP1 isabeti
+    # ölçülüyor ve ayrıca sonuç dağılımı basılıyor.
     if tur == "stop":
         kosul   = "sonuc='STOP'"
         kosul_o = "sonuc='STOP'"
@@ -10482,9 +10486,10 @@ async def _lab_rapor(update: Update, tur: str) -> None:
         sirala  = "acilis_ts DESC"
     elif tur == "hepsi":
         kosul   = "1=1"
-        kosul_o = "1=1"
+        # Oran özeti TP1 üzerinden çıkar — "tüm satırlar isabet" anlamsızdı.
+        kosul_o = "(hit1=1 OR dokundu1=1)"
         baslik  = "📒 TÜM SİNYALLER"
-        yuzde_s = "tam defter"
+        yuzde_s = f"tam defter · isabet ölçütü: TP1 (%{V11_TP1_PCT:g})"
         sirala  = "acilis_ts DESC"
     else:
         n = int(tur[-1])
@@ -10548,6 +10553,12 @@ async def _lab_rapor(update: Update, tur: str) -> None:
     L.append(f"📁 Ham defter: {ham_gec:,} kayıt · dosyada {len(rows):,} satır")
     L.append("")
 
+    yon = _lab_yon_testi(con)
+    if yon:
+        L.append("🎯 YÖN TESTİ — giriş tetiği doğru yönü buluyor mu?")
+        L.extend(yon)
+        L.append("")
+
     bant = _lab_skor_bant_tablo(con, kosul_o)
     if bant:
         L.append("🔢 SKOR BANDI (monoton artmalı — artmıyorsa skor ayırt etmiyor)")
@@ -10608,6 +10619,41 @@ async def cmd_rapor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _lab_rapor(update, "hepsi")
 
 
+def _lab_yon_testi(con) -> List[str]:
+    """V2.4 — GİRİŞİN YÖN GÜCÜ TESTİ. Raporun en önemli satırı.
+
+    Stop %X uzaktaysa, pozisyon %X aleyhe gidince kapanır. Dolayısıyla
+    "MFE >= X" demek: fiyat stopa varmadan ÖNCE aynı mesafeyi lehe gördü.
+
+    Yansız (edge'siz) bir girişte bu oran ~%50 olmalıdır — rastgele yürüyüşte
+    +X'e varma ile -X'e varma eşit olasılıktır. %50'nin ALTI, giriş tetiğinin
+    yön tahmininde ters çalıştığı anlamına gelir; bu bir skor ya da filtre
+    sorunu değildir, tetiğin kendisinin sorunudur.
+
+    Bu tek sayı, bütün skor/kapı/TP tartışmasından daha belirleyicidir."""
+    L = []
+    esik = safe_float(V11_STOP_PCT)
+    try:
+        for ad, filt in (("STRATEJİ", "giris_tipi<>'RASTGELE'"),
+                         ("RASTGELE", "giris_tipi='RASTGELE'")):
+            row = con.execute(
+                f"SELECT COUNT(*), SUM(CASE WHEN mfe_pct >= {esik} THEN 1 ELSE 0 END) "
+                f"FROM lab WHERE sonuc<>'ACIK' AND {filt}").fetchone()
+            n = int(safe_float(row[0])); k = int(safe_float(row[1]))
+            if n < 10:
+                L.append(f"  {ad:<9} n={n} — yetersiz")
+                continue
+            o = k / n * 100.0
+            isaret = "✅" if o > 55 else ("➖" if o > 45 else "🔴")
+            L.append(f"  {isaret} {ad:<9} {k}/{n} = %{o:.1f}  "
+                     f"(stopa varmadan +%{esik:g} gördü)")
+        L.append(f"  📐 Yansız beklenti: %50 — altı, tetiğin YÖN TAHMİNİNDE")
+        L.append(f"     ters çalıştığını gösterir.")
+    except Exception as e:
+        logger.debug("yön testi hatası: %s", e)
+    return L
+
+
 async def cmd_huni2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """V2.2 HUNİ: strateji vs rastgele, her seviye için yan yana.
     Tek bakışta 'edge var mı' sorusunu cevaplar."""
@@ -10616,6 +10662,9 @@ async def cmd_huni2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("🧪 LAB veritabanı yok (LAB_MODE=false?)")
         return
     L = ["🔻 HUNİ — STRATEJİ vs RASTGELE", ""]
+    L.append(f"🎯 YÖN TESTİ (raporun en önemli satırı)")
+    L.extend(_lab_yon_testi(con))
+    L.append("")
     L.append(f"{'seviye':<8}{'strateji':>12}{'rastgele':>12}{'fark':>9}")
     L.append("-" * 41)
     seviyeler = [("TP1", "(hit1=1 OR dokundu1=1)", V11_TP1_PCT),
