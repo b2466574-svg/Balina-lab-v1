@@ -6304,6 +6304,21 @@ _LAB_BASLANGIC_TS    = time.time()      # V2.2: rastgele oranını hesaplamak i�
 # 10 dk önce açılmış sinyali TP oranı paydasına koymak oranı sistematik olarak
 # aşağı çeker. Rapor komutları bu süreden genç sinyalleri paydaya ALMAZ.
 LAB_OLGUNLASMA_SAAT  = float(os.getenv("LAB_OLGUNLASMA_SAAT", "24"))
+# V2.6: RETEST popülasyonunu ölç. true iken LAB, aynı kurulumun hem
+# "beklemeden giren" (TETIK) hem "bekleyip giren" (RETEST) halini kaydeder.
+LAB_RETEST_OLC       = os.getenv("LAB_RETEST_OLC", "true").lower() == "true"
+# V2.6: STOP SONRASI SOĞUMA. Defterde tekrar eden desen: bot hareketi
+# yakalıyor, sonra biten hareketin peşinden koşuyor. ACU 5 giriş (ilk ikisi
+# TP4, OI %548'e çıktıktan sonraki üçü stop), AVNT 4 giriş (ilki TP4,
+# sonraki üçü 0.6–2.3 dk'da stop), LIGHT 6 giriş hepsi stop.
+# TEST EDİLDİ: iki örneklem (438 sinyal) üzerinde geriye dönük denendi.
+# Kapıya takılanlar tutarlı biçimde daha kötü (30–480 dk aralığında hep
+# +%5..+%6.6 fark), yani yön DOĞRU. Ama etki küçük ve hiçbir süre p<0.05'e
+# ulaşmadı (en iyisi 240 dk, p=0.23). Yani "muhtemelen faydalı ama
+# KANITLANMADI". Bu yüzden VARSAYILAN 0 (KAPALI).
+# Bu süre boyunca o sembolde yeni giriş açılmaz. LAB'da giriş yine kaydedilir
+# ama g_soguma=0 ile işaretlenir → "soğuma olsaydı ne olurdu" ölçülebilir.
+LAB_STOP_SOGUMA_DK   = float(os.getenv("LAB_STOP_SOGUMA_DK", "0"))   # 0 = kapalı
 LAB_MILESTONE        = int(float(os.getenv("LAB_MILESTONE", "250")))
 LAB_TARGET_CLOSES    = int(float(os.getenv("LAB_TARGET_CLOSES", "2000")))
 LAB_MIN_CELL         = int(float(os.getenv("LAB_MIN_CELL", "100")))  # bu altındaki hücre yorumlanmaz
@@ -6343,7 +6358,7 @@ def lab_db():
             g_yapi INT, g_range INT, g_choch INT, g_sweep INT, g_retest INT,
             g_cvd INT, g_balina INT, g_spoof INT, g_hacim INT, g_spread INT,
             g_btc INT, g_rsi INT, g_skor INT, g_arastirma INT, g_1d INT,
-            g_volsok INT, g_drift INT, g_tekrar INT, g_hepsi INT,
+            g_volsok INT, g_drift INT, g_tekrar INT, g_soguma INT, g_hepsi INT,
             -- SONUÇ
             sonuc TEXT, r REAL, hit1 INT, hit2 INT, hit3 INT, sure_dk REAL)""")
         # --- LAB v2 GÖÇÜ: eski lab.db dosyasına yeni sütunları ekle ---------
@@ -6356,7 +6371,9 @@ def lab_db():
                  # (stop öncelikli, muhafazakâr); dokundu* ise "fiyat o seviyeye
                  # gerçekten değdi mi" sorusunun tarafsız cevabıdır.
                  "dokundu1":"INT", "dokundu2":"INT",
-                 "dokundu3":"INT", "dokundu4":"INT"}
+                 "dokundu3":"INT", "dokundu4":"INT",
+                 # V2.6: stop sonrası soğuma kapısı
+                 "g_soguma":"INT"}
         try:
             _mevcut = {r[1] for r in con.execute("PRAGMA table_info(lab)")}
             for _c, _t in _yeni.items():
@@ -6382,7 +6399,7 @@ def lab_yeni() -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     for g in ("yapi","range","choch","sweep","retest","cvd","balina","spoof",
               "hacim","spread","btc","rsi","skor","arastirma","1d","volsok",
-              "drift","tekrar","4h","fomo"):
+              "drift","tekrar","4h","fomo","soguma"):
         d["g_" + g] = 1          # varsayılan: geçerdi
     return d
 
@@ -6400,9 +6417,10 @@ def lab_kaydet(sig: Dict[str, Any], lab: Dict[str, Any], giris_tipi: str) -> Opt
         ytip = ("SÜPÜRME DÖNÜŞÜ" if "Süpürme" in yapi else
                 "CHoCH" if "CHoCH" in yapi else "BOS" if "BOS" in yapi else "RASTGELE")
         simdi = tr_now()
+        # SIRA ÖNEMLİ: aşağıdaki INSERT kolon listesiyle birebir eşleşmeli.
         _KAPILAR = ("yapi","range","choch","sweep","retest","cvd","balina","spoof",
                     "hacim","spread","btc","rsi","skor","arastirma","1d",
-                    "volsok","drift","tekrar","4h","fomo")
+                    "volsok","drift","tekrar","soguma","4h","fomo")
         hepsi = 1 if all(int(safe_float(lab.get("g_" + g), 1)) == 1
                          for g in _KAPILAR) else 0
         cur = con.execute(
@@ -6411,8 +6429,8 @@ def lab_kaydet(sig: Dict[str, Any], lab: Dict[str, Any], giris_tipi: str) -> Opt
             "btc_1h,btc_4h,sweep,fib_derinlik,hacim_orani,spread,aralik_konum,oi,funding,"
             "cvd,cvd_n,balina,balina_n,spoof,grafik_puan,haber,saat,gun,"
             "g_yapi,g_range,g_choch,g_sweep,g_retest,g_cvd,g_balina,g_spoof,g_hacim,"
-            "g_spread,g_btc,g_rsi,g_skor,g_arastirma,g_1d,g_volsok,g_drift,g_tekrar,"
-            "g_4h,g_fomo,g_hepsi,sonuc) VALUES(" + ",".join(["?"]*60) + ")",
+            "g_spread,g_btc,g_rsi,g_skor,g_arastirma,g_1d,g_volsok,g_drift,g_tekrar,g_soguma,"
+            "g_4h,g_fomo,g_hepsi,sonuc) VALUES(" + ",".join(["?"]*61) + ")",
             (time.time(), sig.get("symbol"), sig.get("direction"), giris_tipi,
              sig.get("setup"), ytip, safe_float(sig.get("entry")), safe_float(sig.get("stop")),
              safe_float(sig.get("tp1")), safe_float(sig.get("tp2")), safe_float(sig.get("tp3")),
@@ -6439,6 +6457,9 @@ def lab_kaydet(sig: Dict[str, Any], lab: Dict[str, Any], giris_tipi: str) -> Opt
 
 
 def lab_kapat(pos: Dict[str, Any], R: float, outcome: str) -> None:
+    # V2.6: STOP olduysa sembolü soğumaya al.
+    if str(outcome).upper() == "STOP":
+        lab_stop_kaydet(str(pos.get("symbol") or ""))
     con = lab_db()
     if not con:
         return
@@ -7384,7 +7405,16 @@ _ESIK_ORIJINAL: Dict[str, Any] = {
 # 2.000 kapanış sonunda "hangi kapı işe yarardı" sorusunu cevaplayamayız.
 if LAB_FILTRESIZ:
     V126_REQUIRE_SWEEP    = False   # sweep yoksa da geç
-    V126_WAIT_RETEST      = False   # retest bekleme yok, tetikte gir
+    # V2.6: retest kapısı artık KAPATILMIYOR — çünkü kapatılınca kurulum hiç
+    # kurulmuyor ve RETEST popülasyonu HİÇ oluşmuyordu. Üç örneklemde
+    # giris_tipi dağılımı TETIK 265 / RETEST 0 çıktı; yani sistemin asıl
+    # tasarlanmış girişi bir kez bile ölçülmedi.
+    # Açık bırakınca kod zaten LAB'da HER İKİSİNİ de kaydediyor:
+    #   durum=KURULDU → TETIK olarak gir  (beklemeden giren popülasyon)
+    #   durum=ONAY    → RETEST olarak gir (bekleyip giren popülasyon)
+    # Böylece "beklemek işe yarıyor mu" sorusu tek turda cevaplanabilir.
+    if not LAB_RETEST_OLC:
+        V126_WAIT_RETEST  = False   # eski davranış (LAB_RETEST_OLC=false)
     V122_REQUIRE_CVD      = False   # CVD ters olsa da geç
     V122_BLOCK_ON_SPOOF   = False   # spoof riski olsa da geç
     V123_VOL_HARD_GATE    = False   # hacim düşük olsa da geç
@@ -9350,6 +9380,33 @@ def v11_register_stop(symbol: str, side: str) -> None:
     g["box"][symbol] = {"ts": time.time(), "side": side}
 
 
+_LAB_SON_STOP: Dict[str, float] = {}      # sembol -> son STOP zamanı (epoch)
+
+
+def lab_stop_kaydet(symbol: str) -> None:
+    """V2.6: bir sembol STOP olduğunda zamanını yaz. Soğuma buradan hesaplanır."""
+    if symbol:
+        _LAB_SON_STOP[str(symbol)] = time.time()
+
+
+def lab_soguma_kalan(symbol: str) -> float:
+    """Bu sembolde soğumanın bitmesine kaç dakika kaldı? 0 = giriş serbest.
+
+    NEDEN VAR: defterde üç kez tekrar eden desen — bot hareketi yakalıyor,
+    sonra biten hareketin peşinden koşuyor.
+      ACU  : 5 giriş. İlk ikisi TP4. OI %548'e çıktıktan sonraki üçü STOP.
+      AVNT : 4 giriş. İlki TP4. Sonraki üçü 0.6 / 1.2 / 2.3 dakikada STOP.
+      LIGHT: 6 giriş, hepsi STOP.
+    Mevcut v11_repeat_block "aynı sinyal tekrar geldi mi" diye bakıyor;
+    bu ise "bu sembolde AZ ÖNCE stop yedik mi" diye bakar. Farklı sorular."""
+    if LAB_STOP_SOGUMA_DK <= 0:
+        return 0.0
+    son = safe_float(_LAB_SON_STOP.get(str(symbol)))
+    if son <= 0:
+        return 0.0
+    return max(0.0, LAB_STOP_SOGUMA_DK - (time.time() - son) / 60.0)
+
+
 def v11_repeat_block(symbol: str, side: str) -> Optional[str]:
     g = _v11_box(); now = time.time()
     mp = _v10_mem()
@@ -9423,6 +9480,18 @@ async def maybe_send_v10_signal(sig):
     elif not v10_cooldown_ok(symbol):
         if not LAB_MODE: return
         lab["g_tekrar"] = 0
+
+    # --- V2.6: STOP SONRASI SOĞUMA -------------------------------------
+    # Normal modda o sembolde giriş yapılmaz. LAB'da giriş YAPILIR ama
+    # g_soguma=0 işaretlenir → "soğuma olsaydı ne olurdu" sonradan ölçülebilir.
+    _kalan = lab_soguma_kalan(symbol)
+    if _kalan > 0:
+        lab["g_soguma"] = 0
+        stats["v26_soguma_isaret"] = int(safe_float(stats.get("v26_soguma_isaret"))) + 1
+        if not LAB_MODE:
+            logger.info("V2.6 SOĞUMA %s: son stoptan sonra %.0f dk daha bekle",
+                        symbol, _kalan)
+            return
 
     # --- V11 derin araştırma kapısı ---
     try:
@@ -10349,6 +10418,8 @@ _LAB_CSV_KOLON = [
     ("dokundu3", "dokundu3"), ("dokundu4", "dokundu4"),
     ("saat",        "saat"),
     ("gun",         "gun"),
+    ("tekrar_kapisi", "g_tekrar"),
+    ("soguma_kapisi", "g_soguma"),
     ("tum_kapilar_gecti", "g_hepsi"),
 ]
 
@@ -10446,11 +10517,13 @@ def _lab_skor_bant_tablo(con, kosul_sutun: str) -> List[str]:
     olgun = _lab_olgun_kosul()
     L = []
     try:
+        # V2.5: EV yerine MFE kullan. EV sadece kapanmislarda tanimli, o da
+        # "stopu yiyenler" demek → tarafli. MFE acik pozisyonlarda da olculur.
         rows = con.execute(
             f"SELECT CASE WHEN skor<45 THEN '<45' WHEN skor<55 THEN '45-55' "
             f"WHEN skor<65 THEN '55-65' WHEN skor<75 THEN '65-75' ELSE '75+' END AS bant, "
             f"COUNT(*), SUM(CASE WHEN {kosul_sutun} THEN 1 ELSE 0 END), "
-            f"AVG(CASE WHEN sonuc<>'ACIK' THEN r END) "
+            f"AVG(mfe_pct) "
             f"FROM lab WHERE giris_tipi<>'RASTGELE' AND skor>0 AND {olgun} "
             f"GROUP BY bant ORDER BY MIN(skor)").fetchall()
         for bant, n, h, ev in rows:
@@ -10458,7 +10531,7 @@ def _lab_skor_bant_tablo(con, kosul_sutun: str) -> List[str]:
             if n < 3:
                 continue
             L.append(f"  {str(bant):<6} n={n:<4} isabet %{(h/n*100 if n else 0):<5.1f} "
-                     f"EV {safe_float(ev):+.2f}R")
+                     f"ort MFE %{safe_float(ev):.2f}")
     except Exception as e:
         logger.debug("LAB skor bant hatası: %s", e)
     return L
@@ -10620,37 +10693,135 @@ async def cmd_rapor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _lab_yon_testi(con) -> List[str]:
-    """V2.4 — GİRİŞİN YÖN GÜCÜ TESTİ. Raporun en önemli satırı.
+    """V2.5 — GİRİŞİN YÖN GÜCÜ TESTİ.  ⚠️ V2.4'TEKİ PAYDA HATASI DÜZELTİLDİ.
 
-    Stop %X uzaktaysa, pozisyon %X aleyhe gidince kapanır. Dolayısıyla
-    "MFE >= X" demek: fiyat stopa varmadan ÖNCE aynı mesafeyi lehe gördü.
+    V2.4'TEKİ HATA: payda `sonuc<>'ACIK'` ile sınırlıydı. Ama bu bir stop-loss
+    sistemi — bir işlem KAPANIYORSA zaten stopu yemiştir. Yani payda
+    "stopu yiyenler" oluyordu ve oran yapay olarak çöküyordu (%43 yerine %22
+    gösteriyordu). Klasik hayatta kalma yanlılığı.
 
-    Yansız (edge'siz) bir girişte bu oran ~%50 olmalıdır — rastgele yürüyüşte
-    +X'e varma ile -X'e varma eşit olasılıktır. %50'nin ALTI, giriş tetiğinin
-    yön tahmininde ters çalıştığı anlamına gelir; bu bir skor ya da filtre
-    sorunu değildir, tetiğin kendisinin sorunudur.
+    DOĞRU YÖNTEM — bir işlem şu durumda "çözülmüş" sayılır:
+      • mfe_pct >= stop mesafesi   → KAZANDI (stopa varmadan aynı mesafeyi
+                                     lehe gördü; açık ya da kapalı fark etmez)
+      • kapandı ve mfe_pct < stop  → KAYBETTİ
+    Açık VE mfe_pct < stop olanlar HENÜZ ÇÖZÜLMEMİŞTİR; paydaya girmez.
 
-    Bu tek sayı, bütün skor/kapı/TP tartışmasından daha belirleyicidir."""
+    Yorum: yansız bir girişte oran ~%50 olmalıdır (rastgele yürüyüşte +X'e
+    varmakla -X'e varmak eşit olasılıktır). %50 civarı = edge yok.
+    Belirgin altı = giriş dezavantajlı (kayma/fitil dolumu). Üstü = edge var."""
     L = []
     esik = safe_float(V11_STOP_PCT)
     try:
         for ad, filt in (("STRATEJİ", "giris_tipi<>'RASTGELE'"),
                          ("RASTGELE", "giris_tipi='RASTGELE'")):
             row = con.execute(
-                f"SELECT COUNT(*), SUM(CASE WHEN mfe_pct >= {esik} THEN 1 ELSE 0 END) "
-                f"FROM lab WHERE sonuc<>'ACIK' AND {filt}").fetchone()
-            n = int(safe_float(row[0])); k = int(safe_float(row[1]))
-            if n < 10:
-                L.append(f"  {ad:<9} n={n} — yetersiz")
+                f"SELECT SUM(CASE WHEN mfe_pct >= {esik} THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN mfe_pct <  {esik} AND sonuc<>'ACIK' THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN mfe_pct <  {esik} AND sonuc ='ACIK' THEN 1 ELSE 0 END) "
+                f"FROM lab WHERE {filt}").fetchone()
+            kaz = int(safe_float(row[0])); kay = int(safe_float(row[1]))
+            bek = int(safe_float(row[2])); n = kaz + kay
+            if n < 20:
+                L.append(f"  {ad:<9} çözülmüş n={n} — yetersiz (en az 20)")
                 continue
-            o = k / n * 100.0
-            isaret = "✅" if o > 55 else ("➖" if o > 45 else "🔴")
-            L.append(f"  {isaret} {ad:<9} {k}/{n} = %{o:.1f}  "
-                     f"(stopa varmadan +%{esik:g} gördü)")
-        L.append(f"  📐 Yansız beklenti: %50 — altı, tetiğin YÖN TAHMİNİNDE")
-        L.append(f"     ters çalıştığını gösterir.")
+            o = kaz / n * 100.0
+            isaret = "✅" if o > 55 else ("➖" if o >= 45 else "🔴")
+            L.append(f"  {isaret} {ad:<9} {kaz}/{n} = %{o:.1f}"
+                     f"   (bekleyen {bek})")
+        L.append(f"  📐 Payda = çözülmüş işlemler: mfe≥%{esik:g} (kazandı)")
+        L.append(f"     + kapandı & mfe<%{esik:g} (kaybetti). Açık & mfe<%{esik:g} SAYILMAZ.")
+        L.append(f"  📐 Yansız beklenti %50. Civarı = edge yok, altı = giriş dezavantajlı.")
     except Exception as e:
         logger.debug("yön testi hatası: %s", e)
+    return L
+
+
+def _lab_tp_ev_tablosu(con) -> List[str]:
+    """V2.5 — mevcut stop mesafesiyle hangi TP hedefi en iyi?
+
+    ⚠️ KISIT: bu tablo SADECE TP seçimini test eder. 'Daha geniş stop olsaydı'
+    sorusu bu veriyle CEVAPLANAMAZ — pozisyon stopta kapandığı için mae_pct
+    orada sansürlenir; fiyatın daha ne kadar aleyhe gideceği hiç görülmez.
+    Geniş stop denemek için V11_STOP_PCT'yi gerçekten değiştirip yeni veri
+    toplamak gerekir."""
+    L = []
+    s = safe_float(V11_STOP_PCT)
+    try:
+        kay = int(safe_float(con.execute(
+            f"SELECT COUNT(*) FROM lab WHERE giris_tipi<>'RASTGELE' "
+            f"AND mae_pct >= {s}").fetchone()[0]))
+        if kay < 20:
+            return []
+        L.append(f"  {'TP':<7}{'R:R':>6}{'kazanan':>9}{'oran':>8}{'başabaş':>9}{'EV':>9}")
+        for t in (s*0.75, s*1.0, s*1.5, s*2.0, s*3.0, s*4.0):
+            kaz = int(safe_float(con.execute(
+                f"SELECT COUNT(*) FROM lab WHERE giris_tipi<>'RASTGELE' "
+                f"AND mfe_pct >= {t} AND mae_pct < {s}").fetchone()[0]))
+            n = kaz + kay
+            if not n:
+                continue
+            rr = t / s if s else 0.0
+            o = kaz / n
+            L.append(f"  %{t:<6.1f}{rr:>6.2f}{kaz:>9}{o*100:>7.1f}%"
+                     f"{100/(1+rr):>8.1f}%{o*rr-(1-o):>+9.3f}")
+        L.append(f"  ⚠️ Sadece TP seçimini test eder. Stop genişliği için")
+        L.append(f"     V11_STOP_PCT'yi değiştirip YENİ veri toplamak gerekir.")
+    except Exception as e:
+        logger.debug("TP EV tablosu hatası: %s", e)
+    return L
+
+
+def _lab_kapi_kiyas(con, sutun: str, ad: str) -> List[str]:
+    """V2.6 — bir kapının değeri: geçenler vs elenenler, YÖN TESTİ ölçütüyle.
+
+    EV yerine 'mfe >= stop mesafesi' oranını kullanır; çünkü EV yalnızca
+    kapanmış işlemlerde tanımlı ve kapanmış = stopu yemiş demek → taraflı.
+    Bu ölçüt açık pozisyonları da doğru sayar."""
+    L = []
+    esik = safe_float(V11_STOP_PCT)
+    try:
+        for deger, etiket in ((1, "kapıyı geçen"), (0, "kapıya takılan")):
+            row = con.execute(
+                f"SELECT SUM(CASE WHEN mfe_pct >= {esik} THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN mfe_pct <  {esik} AND sonuc<>'ACIK' THEN 1 ELSE 0 END) "
+                f"FROM lab WHERE giris_tipi<>'RASTGELE' AND {sutun}={deger}").fetchone()
+            kaz = int(safe_float(row[0])); n = kaz + int(safe_float(row[1]))
+            if n < 15:
+                L.append(f"  {etiket:<14} çözülmüş n={n} — yetersiz")
+                continue
+            L.append(f"  {etiket:<14} {kaz}/{n} = %{kaz/n*100:.1f}")
+        L.append(f"  → 'takılan' oranı belirgin DÜŞÜKSE {ad} kapısı işe yarıyor demektir.")
+    except Exception as e:
+        logger.debug("kapı kıyas hatası (%s): %s", sutun, e)
+    return L
+
+
+def _lab_giris_tipi_kiyas(con) -> List[str]:
+    """V2.6 — TETIK (beklemeden gir) vs RETEST (teyit bekleyip gir).
+
+    Üç örneklem boyunca defterde RETEST girişi HİÇ oluşmadı; çünkü
+    LAB_FILTRESIZ retest kapısını komple kapatıyordu ve kurulum bir kez bile
+    kurulmadı. LAB_RETEST_OLC=true ile artık ikisi de kaydediliyor."""
+    L = []
+    esik = safe_float(V11_STOP_PCT)
+    try:
+        rows = con.execute(
+            f"SELECT giris_tipi, "
+            f"SUM(CASE WHEN mfe_pct >= {esik} THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN mfe_pct <  {esik} AND sonuc<>'ACIK' THEN 1 ELSE 0 END), "
+            f"COUNT(*) FROM lab GROUP BY giris_tipi").fetchall()
+        varmi = False
+        for tip, kaz, kay, tum in rows:
+            kaz = int(safe_float(kaz)); n = kaz + int(safe_float(kay))
+            if n < 15:
+                L.append(f"  {str(tip):<9} toplam {int(safe_float(tum))}, çözülmüş {n} — yetersiz")
+                continue
+            varmi = True
+            L.append(f"  {str(tip):<9} {kaz}/{n} = %{kaz/n*100:.1f}  (toplam {int(safe_float(tum))})")
+        if varmi:
+            L.append("  → RETEST oranı TETIK'ten yüksekse beklemek değerlidir.")
+    except Exception as e:
+        logger.debug("giriş tipi kıyas hatası: %s", e)
     return L
 
 
@@ -10665,6 +10836,11 @@ async def cmd_huni2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     L.append(f"🎯 YÖN TESTİ (raporun en önemli satırı)")
     L.extend(_lab_yon_testi(con))
     L.append("")
+    _tp = _lab_tp_ev_tablosu(con)
+    if _tp:
+        L.append(f"🎚 MEVCUT STOP (%{V11_STOP_PCT:g}) İLE TP SEÇİMİ")
+        L.extend(_tp)
+        L.append("")
     L.append(f"{'seviye':<8}{'strateji':>12}{'rastgele':>12}{'fark':>9}")
     L.append("-" * 41)
     seviyeler = [("TP1", "(hit1=1 OR dokundu1=1)", V11_TP1_PCT),
@@ -10678,6 +10854,12 @@ async def cmd_huni2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f = s["oran"] - ra["oran"]
         L.append(f"{ad+' %'+f'{yz:g}':<8}{s['hit']:>5}/{s['n']:<5} "
                  f"{ra['hit']:>4}/{ra['n']:<5} {f:>+8.1f}")
+    L.append("")
+    L.append("🧊 SOĞUMA KAPISI (stop sonrası aynı sembole tekrar giriş)")
+    L.extend(_lab_kapi_kiyas(con, "g_soguma", "soğuma"))
+    L.append("")
+    L.append("⏳ GİRİŞ TİPİ (TETIK = beklemeden · RETEST = teyit bekleyip)")
+    L.extend(_lab_giris_tipi_kiyas(con))
     L.append("")
     try:
         row = con.execute(
