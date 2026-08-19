@@ -5917,10 +5917,22 @@ V10_RSI_SHORT_MIN    = float(os.getenv("V10_RSI_SHORT_MIN", "32"))
 V10_FIB_ENABLED      = os.getenv("V10_FIB_ENABLED", "true").lower() == "true"
 # V2.8: KURULUM TİPİ FİLTRESİ. Defterde SÜPÜRME DÖNÜŞÜ 0/16 kazanan (lift 0.00x),
 # CHoCH 5/45 (1.60x), BOS 7/112 (0.90x). Virgülle ayrılmış liste; boş = kapı yok.
-# n=16 küçük bir örneklem — sıfır kazanan çıkması tesadüf olabilir. Bu yüzden
-# LAB'da yine kaydedilir, sadece g_yapi=0 işaretlenir.
+# V2.9: yeni defterde SÜPÜRME 6/27 = %22 (diğerleri %39), Fisher p=0.10.
+# Yön doğru ama hâlâ anlamlı değil → VARSAYILAN BOŞ (kapı yok).
+# Denemek için: V10_BLOK_YAPI="SÜPÜRME DÖNÜŞÜ"
+# ══ V2.9 — BTC REJİMİNE GÖRE YÖN KAPISI ═══════════════════════════════════
+# Defterin en güçlü ayrımı bu (Fisher p = 7.4e-13):
+#     BTC UP/UP rejiminde  →  LONG kazanma %57.0  ·  SHORT kazanma %11.3
+#     141 SHORT'un 125'i tam kayıp. Skor bunları kurtarmıyor:
+#     skor <55 %12, 55-62 %15, 62+ %6 — yani yüksek skorlu SHORT daha da kötü.
+# Yani: BTC yükselirken SHORT açmak akıntıya karşı yüzmek. Ters rejimde
+# aynısı LONG için geçerli olmalı (henüz ölçülmedi, o yüzden simetrik yazıldı).
+# true = BTC 1H ve 4H'in ikisi de aynı yöndeyse, TERS yönde işlem açma.
+# V2.9: BTC 1H+4H aynı yöndeyken TERS yönde işlem açma. Defterdeki en güçlü
+# ayrım (LONG %57 vs SHORT %11.3 · p=7.4e-13). true = kapı açık.
+V29_BTC_YON_KAPISI   = os.getenv("V29_BTC_YON_KAPISI", "true").lower() == "true"
 V10_BLOK_YAPI        = [x.strip().upper() for x in
-                        os.getenv("V10_BLOK_YAPI", "SÜPÜRME DÖNÜŞÜ").split(",") if x.strip()]
+                        os.getenv("V10_BLOK_YAPI", "").split(",") if x.strip()]
 
 # V11: RSI kapısı akıl sağlığı sınırı.
 # 27-28 Tem oturumu env'de LONG max 55 / SHORT min 45 ile çalıştı. Bu ayarla
@@ -7336,7 +7348,13 @@ V10_RISK_PCT         = float(os.getenv("V10_RISK_PCT", "1.5"))
 # V10_MAX_QUALITY, skora ÜST sınır koyar. 0 = kapalı (varsayılan).
 # UYARI: 60 değeri 12 kazanan üzerinde ızgara aramasıyla bulundu → aşırı uydurma
 # riski yüksek. Kapalı geliyor; açıp KENDİ defterinde doğrulaman gerekir.
-V10_MAX_QUALITY      = float(os.getenv("V10_MAX_QUALITY", "62"))
+# ⚠️ V2.9 — TAVAN KAPATILDI. v2.8'de 62 yapmıştım; o değer BTC DOWN
+# rejimindeki 12 kazananın (skor 35.1–59.4) aralığından çıkarılmıştı.
+# BTC UP rejiminde aynı ölçüm TERSİNE döndü: yeni defterdeki 9 büyük
+# kazananın skoru 55.9–78.0 (medyan 66.7) ve tavan bunların 7'sini elerdi.
+# Yani skor–kazanan ilişkisi REJİME BAĞLI, sabit değil. Sabit bir tavan
+# koymak bir rejimde işe yarayıp diğerinde tam ters çalışıyor. 0 = kapalı.
+V10_MAX_QUALITY      = float(os.getenv("V10_MAX_QUALITY", "0"))
 V10_LEARN_MIN_TRADES = int(float(os.getenv("V10_LEARN_MIN_TRADES", "30")))
 V10_LEARN_AUTO_ADJUST = os.getenv("V10_LEARN_AUTO_ADJUST", "false").lower() == "true"
 # --- V2.2: öğrenme mekanizmasının güvenlik kapıları -------------------------
@@ -8832,6 +8850,29 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             v131_say("yapi_tip")
             lab["g_yapi"] = 0
             if not LAB_MODE: return None
+    # ══ V2.9 — BTC REJİMİNE KARŞI İŞLEM KAPISI ═══════════════════════════
+    # Defterin EN GÜÇLÜ ayrımı bu (Fisher p = 7.4e-13):
+    #   BTC 1H+4H ikisi de UP iken:
+    #     LONG  kazanma %57.0  (106/186)
+    #     SHORT kazanma %11.3  ( 16/141)   ← 125 tam kayıp
+    #   Skor SHORT'ları kurtarmıyor: <55 %12 · 55-62 %15 · 62+ %6
+    #   (yüksek skorlu SHORT daha da kötü)
+    # Yani BTC yükselirken SHORT açmak akıntıya karşı yüzmek. Ters rejim
+    # henüz ölçülmedi, o yüzden kural simetrik yazıldı.
+    if V29_BTC_YON_KAPISI:
+        _b1 = str(_LAB_GATE.get("btc_1h") or gate.get("btc_1h") or "")
+        _b4 = str(_LAB_GATE.get("btc_4h") or gate.get("btc_4h") or "")
+        if _b1 and _b1 == _b4:                       # ikisi de aynı yönde
+            _ters = (side == "SHORT" and _b1 == "UP") or (side == "LONG" and _b1 == "DOWN")
+            if _ters:
+                stats["v29_red_btcyon"] = int(stats.get("v29_red_btcyon", 0)) + 1
+                v131_say("btc_yon")
+                lab["g_btc"] = 0
+                if not LAB_MODE:
+                    logger.info("V2.9 BTC YÖN: %s %s — BTC %s/%s, akıntıya karşı",
+                                symbol, side, _b1, _b4)
+                    return None
+
     for _g in ("range", "choch", "sweep", "4h", "fomo"):
         if _g in _LAB_GATE: lab["g_" + _g] = _LAB_GATE[_g]
     lab["sweep"] = 1 if safe_float(_LAB_GATE.get("sweep_deger")) >= 1.0 else 0
