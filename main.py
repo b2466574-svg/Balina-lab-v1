@@ -5716,7 +5716,8 @@ async def post_init(application) -> None:
             BotCommand("stop",  "STOP olan sinyaller + CSV dosyası"),
             BotCommand("rapor", "TÜM defter — tek CSV"),
             BotCommand("huni2", "Strateji vs rastgele kontrol grubu"),
-            BotCommand("kazanan", "Kazanan profili — hangi kapı kazananı eliyor"),
+            BotCommand("kazanan", "Kazanan profili"),
+            BotCommand("denetim", "Kapı denetimi — kapılar kazananı kesiyor mu"),
             BotCommand("mfe_tamir", "Donmuş MFE verisini onar (bir kez çalıştır)"),
             BotCommand("status", "Bot durumu"),
             BotCommand("v10",   "V10 motor detayı"),
@@ -5725,6 +5726,18 @@ async def post_init(application) -> None:
         ])
     except Exception as e:
         logger.debug("Komut menüsü ayarlanamadı: %s", e)
+
+    # V3.0: açılışta kapıları kazananlara karşı denetle, sorun varsa uyar.
+    try:
+        if LAB_MODE:
+            _d = v3_kapi_denetimi()
+            if _d.get("uyari"):
+                logger.warning("🔴 V3 KAPI DENETİMİ — kazananı kesen kapı var:")
+                for _x in _d["uyari"]:
+                    logger.warning("   • %s", _x)
+                stats["v3_kapi_uyari"] = len(_d["uyari"])
+    except Exception as _e:
+        logger.debug("açılış denetimi hatası: %s", _e)
 
     active_count, pruned_count = await refresh_coin_pool(force=True)
 
@@ -5910,10 +5923,20 @@ V10_STOP_MAX_PCT     = float(os.getenv("V10_STOP_MAX_PCT", "0.05"))
 # Yeni eşikler kazanan aralığının biraz DIŞINA konuldu (kenar payı):
 #     105/173 sinyal geçer · 12/12 kazanan KORUNUR · lift 1.65x
 V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "33"))
-V10_RSI_LONG_MAX     = float(os.getenv("V10_RSI_LONG_MAX", "82"))
-V10_RSI_LONG_MIN     = float(os.getenv("V10_RSI_LONG_MIN", "35"))   # V2.8 yeni
-V10_RSI_SHORT_MAX    = float(os.getenv("V10_RSI_SHORT_MAX", "72"))  # V2.8 yeni
-V10_RSI_SHORT_MIN    = float(os.getenv("V10_RSI_SHORT_MIN", "32"))
+# ══ V3.0 — RSI BANTLARI 96 TP4 KAZANANINDAN ÇIKARILDI ═════════════════════
+# Kazananların ÖLÇÜLEN RSI aralığı:
+#   LONG  (n=89): 19.2 – 98.0   medyan 70.4   %75'lik dilim 83.9
+#   SHORT (n= 4): 28.4 – 89.9   (iki uçta kümeleniyor, ortada yok)
+# v2.8'de koyduğum LONG 35–82 bandı bu kazananların 27'sini eliyordu:
+#   SPK 98.0 · GMT 95.3 · TIA 95.1 · ASTER 92.3 · CRO 92.1 · STX 92.1 …
+# Kırılım anında RSI'nin YÜKSEK olması normaldir — fiyat yeni seviyeye
+# atlamıştır. RSI'yi üst sınır olarak kullanmak momentumun en güçlü anını
+# keser. Bantlar kazanan aralığının dışına açıldı; pratikte yalnızca uç
+# değerleri (RSI<15 gibi veri hatası) engelliyor.
+V10_RSI_LONG_MAX     = float(os.getenv("V10_RSI_LONG_MAX", "100"))
+V10_RSI_LONG_MIN     = float(os.getenv("V10_RSI_LONG_MIN", "15"))
+V10_RSI_SHORT_MAX    = float(os.getenv("V10_RSI_SHORT_MAX", "95"))
+V10_RSI_SHORT_MIN    = float(os.getenv("V10_RSI_SHORT_MIN", "25"))
 V10_FIB_ENABLED      = os.getenv("V10_FIB_ENABLED", "true").lower() == "true"
 # V2.8: KURULUM TİPİ FİLTRESİ. Defterde SÜPÜRME DÖNÜŞÜ 0/16 kazanan (lift 0.00x),
 # CHoCH 5/45 (1.60x), BOS 7/112 (0.90x). Virgülle ayrılmış liste; boş = kapı yok.
@@ -5931,6 +5954,9 @@ V10_FIB_ENABLED      = os.getenv("V10_FIB_ENABLED", "true").lower() == "true"
 # V2.9: BTC 1H+4H aynı yöndeyken TERS yönde işlem açma. Defterdeki en güçlü
 # ayrım (LONG %57 vs SHORT %11.3 · p=7.4e-13). true = kapı açık.
 V29_BTC_YON_KAPISI   = os.getenv("V29_BTC_YON_KAPISI", "true").lower() == "true"
+# V3.0 — kapı öz denetimi: bir kapı kazananların bu orandan fazlasını eliyorsa uyar
+V3_DENETIM_UYARI_ORAN   = float(os.getenv("V3_DENETIM_UYARI_ORAN", "0.20"))
+V3_DENETIM_MIN_KAZANAN  = int(float(os.getenv("V3_DENETIM_MIN_KAZANAN", "10")))
 V10_BLOK_YAPI        = [x.strip().upper() for x in
                         os.getenv("V10_BLOK_YAPI", "").split(",") if x.strip()]
 
@@ -6333,7 +6359,10 @@ _LAB_BASLANGIC_TS    = time.time()      # V2.2: rastgele oranını hesaplamak i�
 # V2.2: bir sinyalin "sonucu belli" sayılması için geçmesi gereken süre.
 # 10 dk önce açılmış sinyali TP oranı paydasına koymak oranı sistematik olarak
 # aşağı çeker. Rapor komutları bu süreden genç sinyalleri paydaya ALMAZ.
-LAB_OLGUNLASMA_SAAT  = float(os.getenv("LAB_OLGUNLASMA_SAAT", "24"))
+# V3.0: 96 TP4 kazananının medyan yaşam süresi 2343 dk = 39 SAAT.
+# %25'lik dilim bile 1655 dk = 27.5 saat. 24 saatlik olgunlaşma penceresi
+# kazananların yarısını "henüz olgunlaşmadı" diye paydadan çıkarıyordu.
+LAB_OLGUNLASMA_SAAT  = float(os.getenv("LAB_OLGUNLASMA_SAAT", "48"))
 # V2.6: RETEST popülasyonunu ölç. true iken LAB, aynı kurulumun hem
 # "beklemeden giren" (TETIK) hem "bekleyip giren" (RETEST) halini kaydeder.
 LAB_RETEST_OLC       = os.getenv("LAB_RETEST_OLC", "true").lower() == "true"
@@ -10329,6 +10358,8 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Canlı WS: {'🟢 akıyor' if v12_health()['ok'] else ('🔴 veri yok' if _V12_WS_OK else '⛔ kütüphane yok')}"
         f" — detay için /ws",
         arkaplan_durumu(),      # V2.2: ölen arka plan döngüsü var mı?
+        (f"🔴 {int(safe_float(stats.get('v3_kapi_uyari')))} kapı kazananı kesiyor — /denetim"
+         if safe_float(stats.get("v3_kapi_uyari")) else "✅ Kapılar kazananı kesmiyor"),
         f"Red sayaçları: tekrar={int(stats.get('v11_red_tekrar',0))} araştırma={int(stats.get('v11_red_arastirma',0))} "
         f"range={int(stats.get('v11_red_range',0))} choch={int(stats.get('v11_red_choch',0))} drift={int(stats.get('v11_red_drift',0))}",
     ]
@@ -10919,6 +10950,117 @@ def _lab_giris_tipi_kiyas(con) -> List[str]:
     return L
 
 
+def v3_kapi_denetimi(con=None) -> Dict[str, Any]:
+    """V3.0 — KAPI ÖZ DENETİMİ. Bu sürümün asıl yeniliği.
+
+    SORUN: her eşik ayarında aynı döngüye giriliyordu — bir kapı konuluyor,
+    günler sonra o kapının KAZANANLARI kestiği fark ediliyordu. Ölçülen
+    örnekler: skor eşiği (65) 12 TP4 kazananının 12'sini; RSI bandı (35–82)
+    96 kazananın 27'sini eliyordu. İkisi de ancak elle analizle görüldü.
+
+    ÇÖZÜM: bot kendi defterindeki kazananları okur ve her kapıyı onlara karşı
+    test eder. Bir kapı kazananların belirli bir oranından fazlasını eliyorsa
+    uyarı verir. Böylece "kapı kazananı kesiyor" hatası günlerce gizli kalamaz.
+
+    Kazanan ölçütü: mfe_pct >= V11_TP4_PCT — R muhasebesinden bağımsızdır ve
+    açık pozisyonları da doğru sayar.
+
+    ⚠️ Bu denetim eşikleri OTOMATİK DEĞİŞTİRMEZ, sadece rapor eder. Az sayıda
+    kazanana göre otomatik eşik oynatmak aşırı uydurmadır."""
+    sonuc: Dict[str, Any] = {"n": 0, "uyari": [], "ok": [], "bagimsiz_an": 0}
+    con = con or lab_db()
+    if not con:
+        return sonuc
+    try:
+        hedef = safe_float(V11_TP4_PCT)
+        kaz = con.execute(
+            f"SELECT yon, skor, rsi, yapi_tipi, btc_1h, btc_4h, acilis_ts "
+            f"FROM lab WHERE giris_tipi<>'RASTGELE' AND mfe_pct >= {hedef}"
+        ).fetchall()
+        sonuc["n"] = len(kaz)
+        if len(kaz) < V3_DENETIM_MIN_KAZANAN:
+            return sonuc
+
+        # Aynı dakikadaki kazananlar TEK olay sayılır. Ölçülen defterde
+        # 96 kazananın 38'i yalnızca iki dakikadan geliyordu; bunları ayrı
+        # gözlem saymak örneklemi olduğundan büyük gösterir.
+        sonuc["bagimsiz_an"] = len({int(safe_float(r[6]) // 60) for r in kaz})
+
+        kapilar = []
+        _sk = [safe_float(r[1]) for r in kaz if safe_float(r[1]) > 0]
+        if _sk:
+            kapilar.append(("skor alt sınırı", f"≥{V10_MIN_QUALITY:g}",
+                            sum(1 for x in _sk if x < V10_MIN_QUALITY), len(_sk)))
+            if V10_MAX_QUALITY > 0:
+                kapilar.append(("skor üst sınırı", f"≤{V10_MAX_QUALITY:g}",
+                                sum(1 for x in _sk if x > V10_MAX_QUALITY), len(_sk)))
+        for _y, _lo, _hi, _ad in (("LONG", V10_RSI_LONG_MIN, V10_RSI_LONG_MAX, "RSI LONG"),
+                                  ("SHORT", V10_RSI_SHORT_MIN, V10_RSI_SHORT_MAX, "RSI SHORT")):
+            _r = [safe_float(r[2]) for r in kaz if str(r[0]) == _y]
+            if len(_r) >= 4:
+                kapilar.append((_ad, f"{_lo:g}–{_hi:g}",
+                                sum(1 for x in _r if not (_lo <= x <= _hi)), len(_r)))
+        if V10_BLOK_YAPI:
+            kapilar.append(("kurulum bloğu", ",".join(V10_BLOK_YAPI),
+                            sum(1 for r in kaz if str(r[3] or "").upper() in V10_BLOK_YAPI),
+                            len(kaz)))
+        if V29_BTC_YON_KAPISI:
+            _n = sum(1 for r in kaz
+                     if str(r[4]) == str(r[5]) and
+                     ((str(r[0]) == "SHORT" and str(r[4]) == "UP") or
+                      (str(r[0]) == "LONG" and str(r[4]) == "DOWN")))
+            kapilar.append(("BTC yön kapısı", "açık", _n, len(kaz)))
+
+        for ad, deger, elenen, toplam in kapilar:
+            if not toplam:
+                continue
+            oran = elenen / toplam
+            satir = (f"{ad} ({deger}) → kazananların {elenen}/{toplam}'ini "
+                     f"eliyor (%{oran*100:.0f})")
+            (sonuc["uyari"] if oran >= V3_DENETIM_UYARI_ORAN
+             else sonuc["ok"]).append(satir)
+    except Exception as e:
+        logger.debug("kapı denetimi hatası: %s", e)
+    return sonuc
+
+
+async def cmd_denetim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """V3.0 — /denetim : her kapı, defterdeki kazananlara karşı test edilir."""
+    d = v3_kapi_denetimi()
+    if not d["n"]:
+        await update.message.reply_text(
+            "🧪 LAB veritabanı yok ya da henüz kazanan kaydı yok.")
+        return
+    L = [f"🔍 KAPI DENETİMİ (kazanan ölçütü: MFE ≥ %{V11_TP4_PCT:g})", ""]
+    L.append(f"Defterdeki kazanan : {d['n']}")
+    if d.get("bagimsiz_an"):
+        L.append(f"Farklı dakika      : {d['bagimsiz_an']}")
+        if d["bagimsiz_an"] < d["n"] * 0.7:
+            L.append(f"⚠️ Kazananlar kümelenmiş — bunlar {d['n']} BAĞIMSIZ gözlem değil.")
+    L.append("")
+    if d["n"] < V3_DENETIM_MIN_KAZANAN:
+        L.append(f"Denetim için en az {V3_DENETIM_MIN_KAZANAN} kazanan gerekir.")
+    else:
+        if d["uyari"]:
+            L.append("🔴 KAZANANI KESEN KAPILAR")
+            for x in d["uyari"]:
+                L.append(f"   • {x}")
+            L.append("")
+        if d["ok"]:
+            L.append("✅ SORUNSUZ KAPILAR")
+            for x in d["ok"]:
+                L.append(f"   • {x}")
+        if not d["uyari"]:
+            L.append("")
+            L.append("Hiçbir kapı kazananların "
+                     f"%{V3_DENETIM_UYARI_ORAN*100:.0f}'inden fazlasını elemiyor.")
+    L.append("")
+    L.append("📐 Bu denetim eşikleri OTOMATİK DEĞİŞTİRMEZ, sadece rapor eder.")
+    metin = "\n".join(L)
+    for i in range(0, len(metin), 3800):
+        await update.message.reply_text(metin[i:i+3800])
+
+
 async def cmd_kazanan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """V2.7 — KAZANAN PROFİLİ. "Sistemi kazananlara göre ayarla" sorusunun
     cevabını doğrudan defterden çıkarır.
@@ -11197,7 +11339,8 @@ def build_app():
     application.add_handler(CommandHandler("stop", cmd_stop))     # STOP olanlar
     application.add_handler(CommandHandler("rapor", cmd_rapor))   # tüm defter
     application.add_handler(CommandHandler("huni2", cmd_huni2))   # strateji vs rastgele
-    application.add_handler(CommandHandler("kazanan", cmd_kazanan))  # V2.7 kazanan profili
+    application.add_handler(CommandHandler("kazanan", cmd_kazanan))
+    application.add_handler(CommandHandler("denetim", cmd_denetim))  # V3.0 kapı denetimi
     application.add_handler(CommandHandler("mfe_tamir", cmd_mfe_tamir))  # V2.3 onarım
     return application
 
